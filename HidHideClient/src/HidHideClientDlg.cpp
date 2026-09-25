@@ -73,6 +73,8 @@ BEGIN_MESSAGE_MAP(CHidHideClientDlg, CDialogEx)
     ON_WM_WINDOWPOSCHANGING()
     ON_WM_CLOSE()
     ON_WM_DESTROY()
+    ON_WM_QUERYENDSESSION()
+    ON_WM_ENDSESSION()
     ON_WM_SYSCOMMAND()
     ON_MESSAGE(WM_DEVICES_CHANGED, &CHidHideClientDlg::OnDevicesChanged)
     ON_MESSAGE(WM_PROFILE_CHANGED, &CHidHideClientDlg::OnProfileChanged)
@@ -417,6 +419,32 @@ void CHidHideClientDlg::OnOK()
 
 void CHidHideClientDlg::OnDestroy()
 {
+    ReleaseEngine();
+    CDialogEx::OnDestroy();
+}
+
+BOOL CHidHideClientDlg::OnQueryEndSession()
+{
+    // Never veto and never restore here: the session end may still be cancelled.
+    return TRUE;
+}
+
+void CHidHideClientDlg::OnEndSession(BOOL ending)
+{
+    // Logoff, shutdown and Restart Manager terminate the process soon after this
+    // returns, without WM_DESTROY. Stop the engine and restore the baseline now,
+    // as tray Exit does; if restoration is not confirmed the recovery record is
+    // kept so the next start recovers. A cancelled session end changes nothing.
+    if (!ending) return;
+    auto const blocking{ ::ShutdownBlockReasonCreate(m_hWnd, L"Restoring HidHide device settings") != FALSE };
+    ReleaseEngine();
+    if (blocking) ::ShutdownBlockReasonDestroy(m_hWnd);
+    m_Exiting = true; CDialogEx::OnCancel();
+}
+
+// Idempotent: runs from WM_ENDSESSION and again from WM_DESTROY.
+void CHidHideClientDlg::ReleaseEngine()
+{
     if (!m_Acceptance) ::RemovePropW(m_hWnd, HidHide::ManagerActivation::WindowProperty);
     if (m_DeviceNotification)
     {
@@ -438,7 +466,6 @@ void CHidHideClientDlg::OnDestroy()
     if (m_DeviceWake) { ::CloseHandle(m_DeviceWake); m_DeviceWake = nullptr; }
     if (m_ProfilesCoordinator) { m_ProfilesCoordinator->SetNotificationWindow(nullptr, 0); m_ProfilesCoordinator->Stop(); }
     RemoveTrayIcon();
-    CDialogEx::OnDestroy();
 }
 
 _Use_decl_annotations_

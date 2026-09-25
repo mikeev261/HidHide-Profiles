@@ -142,6 +142,7 @@ private:
     void UpdateTrayTooltip();
     void ChannelWorkerMain() noexcept;
     void DeviceWorkerMain() noexcept;
+    void ReleaseEngine();
 
     // Events
     afx_msg void OnPaint();
@@ -149,6 +150,8 @@ private:
     afx_msg void OnWindowPosChanging(WINDOWPOS* position);
     afx_msg void OnClose();
     afx_msg void OnDestroy();
+    afx_msg BOOL OnQueryEndSession();
+    afx_msg void OnEndSession(BOOL ending);
     afx_msg void OnSysCommand(UINT id, LPARAM parameter);
     afx_msg LRESULT OnDevicesChanged(WPARAM, LPARAM);
     afx_msg LRESULT OnProfileChanged(WPARAM, LPARAM);
