@@ -72,6 +72,16 @@ namespace HidHide
         return std::wstring(L"Global\\HidHide.Profiles.Msi.") + role + L"." + transaction;
     }
 
+    // Handshake events between this helper and the elevated MSI actions. Only
+    // the initiating user, SYSTEM and Administrators may signal them.
+    inline Channel::Handle CreateMsiEvent(PCWSTR role, std::wstring const& transaction)
+    {
+        Channel::Security security(L"D:P(A;;0x00100002;;;" + Channel::CurrentSid() + L")(A;;GA;;;SY)(A;;GA;;;BA)");
+        auto handle = ::CreateEventExW(&security.attributes, MsiEventName(role, transaction).c_str(), CREATE_EVENT_MANUAL_RESET, SYNCHRONIZE | EVENT_MODIFY_STATE);
+        if (!handle) throw std::runtime_error("Cannot create Windows Installer maintenance events");
+        return Channel::Own(handle);
+    }
+
     // Windows Installer runs this helper as the initiating ordinary user before
     // its elevated execute sequence. It restores the confirmed baseline, hands
     // configuration ownership to the protected MSI action, and retains the
@@ -81,12 +91,7 @@ namespace HidHide
     {
         Maintenance::RequireOrdinaryUser();
         auto session = FilterDriverProxy::BeginMaintenance();
-        Channel::Security security(L"D:P(A;;0x00100002;;;AU)(A;;GA;;;SY)(A;;GA;;;BA)");
-        auto ready = Channel::Own(::CreateEventExW(&security.attributes, MsiEventName(L"Ready", transaction).c_str(),
-            CREATE_EVENT_MANUAL_RESET, SYNCHRONIZE | EVENT_MODIFY_STATE));
-        auto release = Channel::Own(::CreateEventExW(&security.attributes, MsiEventName(L"Release", transaction).c_str(),
-            CREATE_EVENT_MANUAL_RESET, SYNCHRONIZE | EVENT_MODIFY_STATE));
-        if (!ready || !release) throw std::runtime_error("Cannot create Windows Installer maintenance events");
+        auto ready = CreateMsiEvent(L"Ready", transaction), release = CreateMsiEvent(L"Release", transaction);
         session->Handoff();
         if (!::SetEvent(ready.get())) throw std::runtime_error("Cannot signal Windows Installer maintenance readiness");
         auto const result = ::WaitForSingleObject(release.get(), 5 * 60 * 1000);

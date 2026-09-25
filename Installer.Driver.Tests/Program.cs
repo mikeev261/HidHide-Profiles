@@ -270,6 +270,8 @@ try { Console.WriteLine($"{DirectMsiFlowChecks.Run()} direct MSI flow checks pas
 catch (Exception error) { Console.WriteLine("DIRECT MSI FLOW CHECK FAILED: " + error.Message); throw; }
 try { Console.WriteLine($"{PayloadCacheChecks.Run()} payload cache checks passed."); }
 catch (Exception error) { Console.WriteLine("PAYLOAD CACHE CHECK FAILED: " + error.Message); throw; }
+try { Console.WriteLine($"{ProtectedDirectoryChecks.Run()} protected directory checks passed."); }
+catch (Exception error) { Console.WriteLine("PROTECTED DIRECTORY CHECK FAILED: " + error.Message); throw; }
 
 sealed class MemoryJournal : ITransactionJournal {
  public int Writes; public int FailWrite;

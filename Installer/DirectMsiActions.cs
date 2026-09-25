@@ -113,7 +113,7 @@ public static class DirectMsiActions
             {
                 ValidateHelper(helper, sid, operation);
                 using var lease = new MaintenanceLease(id, createPreparation: helper == 0);
-                PreparePayload();
+                PreparePayload(session.Log);
                 var backend = new WindowsDriverBackend(Path.Combine(ProtectedJournal.Root, "payload"), lease.AssertHeld);
                 var before = backend.Inspect();
                 DirectMsiFlow.ValidateStartingState(operation, before);
@@ -290,9 +290,9 @@ public static class DirectMsiActions
         foreach (var sid in new[] { Admins, SystemSid }) acl.AddAccessRule(new FileSystemAccessRule(sid, FileSystemRights.FullControl, AccessControlType.Allow));
         return acl;
     }
-    static void PreparePayload()
+    static void PreparePayload(Action<string> log)
     {
-        ProtectedJournal.CreateRoot();
+        ProtectedJournal.CreateRoot(log);
         string target = Path.Combine(ProtectedJournal.Root, "payload");
         string source = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "HidHide", "Driver");
         if (!Directory.Exists(target))
