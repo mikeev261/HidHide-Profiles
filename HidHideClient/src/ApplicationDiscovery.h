@@ -101,6 +101,19 @@ namespace HidHide::Applications
     }
     struct Application { Process process; std::wstring name; unsigned instances{1}; };
     using Query = std::function<std::optional<Process>(std::uint32_t)>;
+    // Process creation time sent back by the editor as decimal text.
+    inline std::optional<std::uint64_t> ParseCreationTime(std::wstring const& text)
+    {
+        if (text.empty() || text.size() > 20 || text.find_first_not_of(L"0123456789") != std::wstring::npos) return std::nullopt;
+        std::uint64_t value{};
+        for (auto c : text)
+        {
+            auto digit = static_cast<std::uint64_t>(c - L'0');
+            if (value > (UINT64_MAX - digit) / 10) return std::nullopt;
+            value = value * 10 + digit;
+        }
+        return value;
+    }
     inline bool SameProcess(Process const& selected, Query const& query)
     {
         auto current = query(selected.pid);

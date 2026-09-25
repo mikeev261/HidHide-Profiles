@@ -106,3 +106,13 @@ TEST(ApplicationDiscovery, UnicodePathsUseWindowsOrdinalCaseComparison)
     ASSERT_EQ(1u,rows.size()); EXPECT_EQ(2u,rows[0].instances);
     EXPECT_TRUE(SameProcess(Process{1,1,L"C:\\\u00c9preuve\\racer.exe",false},[](auto)->std::optional<Process>{return Process{1,1,L"c:\\\u00e9preuve\\RACER.EXE",true};}));
 }
+
+TEST(ApplicationDiscovery, CreationTimeOutsideUint64IsRejectedWithoutThrowing)
+{
+    // #32: stoull threw a raw out_of_range for 20-digit values above ULLONG_MAX.
+    std::optional<std::uint64_t> parsed{ 1 };
+    EXPECT_NO_THROW(parsed = ParseCreationTime(L"99999999999999999999")); EXPECT_FALSE(parsed);
+    EXPECT_EQ(18446744073709551615ull, ParseCreationTime(L"18446744073709551615").value_or(0));
+    EXPECT_FALSE(ParseCreationTime(L"18446744073709551616")); EXPECT_FALSE(ParseCreationTime(L"")); EXPECT_FALSE(ParseCreationTime(L"-1"));
+    EXPECT_EQ(133000000000000000ull, ParseCreationTime(L"133000000000000000").value_or(0));
+}

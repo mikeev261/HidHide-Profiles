@@ -128,9 +128,9 @@ namespace HidHide::Applications
                 auto path = AsString(Required(object, L"path")); RequireFile(path);
                 if (command == L"validate")
                 {
-                    auto pid = AsUnsigned(Required(object, L"pid")); auto created = AsString(Required(object, L"created"));
-                    if (!pid || pid > UINT32_MAX || created.empty() || created.size() > 20 || created.find_first_not_of(L"0123456789") != std::wstring::npos
-                        || !SameProcess(Process{static_cast<std::uint32_t>(pid), std::stoull(created), path, false}, QueryProcess))
+                    auto pid = AsUnsigned(Required(object, L"pid")); auto created = ParseCreationTime(AsString(Required(object, L"created")));
+                    if (!pid || pid > UINT32_MAX || !created
+                        || !SameProcess(Process{static_cast<std::uint32_t>(pid), *created, path, false}, QueryProcess))
                         throw std::runtime_error("This application has exited or changed. Refresh and choose it again.");
                 }
                 response = L"{\"application\":" + Encode(Application{Process{0, 0, path, false}, SuggestName(path, ReadMetadata(path)), 1}) + L"}";

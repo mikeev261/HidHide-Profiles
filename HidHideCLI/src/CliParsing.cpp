@@ -57,8 +57,10 @@ namespace HidHide::CliParsing
 
         while ((!Trim(value).empty()) && (L"--" != value.substr(0, 2)))
         {
+            // An empty result is a syntax error only when nothing was consumed; "" is a valid empty argument
+            auto const remaining{ value.size() };
             auto const arg{ ExtractString(value) };
-            if ((arg.empty()) && (!value.empty())) return (Args{});
+            if ((arg.empty()) && (remaining == value.size())) return (Args{});
             result.emplace_back(arg);
         }
 
