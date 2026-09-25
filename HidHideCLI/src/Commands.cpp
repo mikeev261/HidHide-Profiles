@@ -195,12 +195,9 @@ namespace HidHide
     void CommandInterpreter::AppClean(Args const&)
     {
         TRACE_ALWAYS(L"");
-        for (auto const& fullImageName : m_FilterDriverProxy.GetWhitelist())
+        for (auto const& fullImageName : HidHide::MissingWhitelistEntries(m_FilterDriverProxy.GetWhitelist()))
         {
-            if (!std::filesystem::exists(HidHide::FullImageNameToFileName(fullImageName)))
-            {
-                m_FilterDriverProxy.WhitelistDelEntry(fullImageName);
-            }
+            m_FilterDriverProxy.WhitelistDelEntry(fullImageName);
         }
     }
 

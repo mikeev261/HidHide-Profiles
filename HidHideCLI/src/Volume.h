@@ -15,4 +15,7 @@ namespace HidHide
     // Determine the file name associated with a full image name
     // Return an empty path when the logical file name couldn't be located on any of the volumes present
     std::filesystem::path FullImageNameToFileName(_In_ FullImageName const& fullImageName);
+
+    // Select the whitelist entries whose executable no longer exists
+    FullImageNames MissingWhitelistEntries(_In_ FullImageNames const& whitelist);
 }

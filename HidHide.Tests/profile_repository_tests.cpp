@@ -1430,3 +1430,20 @@ TEST(ProcessLifetimeCache, RecycledPidDuringIncompleteInactiveGapExpiresPinAfter
     EXPECT_EQ((std::vector<std::wstring>{f.c,f.a,f.b}),f.history.Running());
     cache.ConsumeExited(); EXPECT_EQ(f.a,f.Scan({b,successor}));
 }
+
+TEST(CliAppClean, KeepsFeedersOnVolumesThatAreNotMounted)
+{
+    // --app-clean removes only entries whose executable is provably gone. A
+    // feeder on a volume that is not mounted (for example an unplugged USB
+    // drive) must stay whitelisted so it can still read hidden devices.
+    std::vector<wchar_t> module(32768);
+    auto size = ::GetModuleFileNameW(nullptr, module.data(), static_cast<DWORD>(module.size())); ASSERT_GT(size, 0u);
+    std::filesystem::path present(std::wstring(module.data(), size));
+    TempDirectory temp; auto removed = temp.path / L"Uninstalled.exe";
+    auto presentImage = HidHide::FileNameToFullImageName(present), removedImage = HidHide::FileNameToFullImageName(removed);
+    ASSERT_FALSE(presentImage.empty()); ASSERT_FALSE(removedImage.empty());
+    HidHide::FullImageName unmounted{ L"\Device\DefinitelyMissingVolume\Feeder.exe" };
+    auto missing = HidHide::MissingWhitelistEntries({ presentImage, removedImage, unmounted });
+    std::wstring kept; for (auto const& image : missing) kept += image.native() + L";";
+    EXPECT_TRUE(missing == HidHide::FullImageNames({ removedImage })) << Json::ToUtf8(kept);
+}
