@@ -103,6 +103,7 @@ CProfilesCoordinator::CProfilesCoordinator(HidHide::Profiles::IEnforcement& enfo
     {
         catalogValid = false; m_Conflict = true; m_Status = L"Global Allowed apps changed outside HidHide Profiles; activation is blocked until reviewed";
     }
+    m_AllowedApplicationsUnchecked = m_RepositoryInvalid && !m_Conflict;
     if (catalogValid && m_SystemIntegration)
     {
         try { m_StartupIssue = UpdateAutoStart(m_Snapshot.settings.startWithWindows); }
@@ -278,6 +279,19 @@ void CProfilesCoordinator::RepositoryWatcherMain() noexcept
     ::FindCloseChangeNotification(changed);
 }
 
+// The startup Allowed-app comparison cannot run while the repository is
+// invalid. Run it on the first valid snapshot, so an external change (for
+// example a feeder registered with --app-reg) is reviewed, not overwritten.
+void CProfilesCoordinator::CheckDeferredAllowedApplications()
+{
+    if (!std::exchange(m_AllowedApplicationsUnchecked, false) || m_Conflict) return;
+    auto observed = m_Enforcement.Observe();
+    if (!observed.success || !observed.observedKnown)
+    { m_Conflict = true; m_Status = observed.failure.empty() ? L"Driver state is unknown; activation is blocked" : observed.failure; }
+    else if (observed.observed.allowedApplications != m_Snapshot.settings.allowedApplications)
+    { m_Conflict = true; m_Status = L"Global Allowed apps changed outside HidHide Profiles; activation is blocked until reviewed"; }
+}
+
 bool CProfilesCoordinator::ReloadRepositoryIfChanged()
 {
     try
@@ -287,7 +301,7 @@ bool CProfilesCoordinator::ReloadRepositoryIfChanged()
         HidHide::Profiles::Validate(loaded.snapshot); m_EffectiveVerified = false; m_RunningProfiles.clear(); m_MissingProfiles.clear();
         m_Snapshot = std::move(loaded.snapshot); m_Issues = std::move(loaded.issues);
         m_SettingsVersion = std::move(loaded.settingsVersion); m_ProfileVersions = std::move(loaded.profileVersions); m_RepositoryInvalid = false;
-        m_Status = L"Repository changed outside this window; open drafts require conflict review"; SubmitSnapshot(); return true;
+        m_Status = L"Repository changed outside this window; open drafts require conflict review"; CheckDeferredAllowedApplications(); SubmitSnapshot(); return true;
     }
     catch (std::exception const& error)
     {
@@ -363,7 +377,7 @@ CProfilesCoordinator::ApplyOutcome CProfilesCoordinator::PublishSaved(HidHide::P
         // Observe/Reconcile readback may mark the new snapshot effective.
         m_EffectiveVerified = false; m_RunningProfiles.clear(); m_MissingProfiles.clear();
         m_Snapshot = std::move(loaded.snapshot); m_Issues.clear(); m_RepositoryInvalid = false;
-        m_SettingsVersion = std::move(loaded.settingsVersion); m_ProfileVersions = std::move(loaded.profileVersions); SubmitSnapshot();
+        m_SettingsVersion = std::move(loaded.settingsVersion); m_ProfileVersions = std::move(loaded.profileVersions); CheckDeferredAllowedApplications(); SubmitSnapshot();
         // Publication is the durable decision boundary. Once the reviewed
         // draft is saved, activation failures must remain retryable without
         // requiring a fabricated second JSON revision.
