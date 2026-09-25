@@ -88,7 +88,10 @@ namespace HidHide
         {
             UNREFERENCED_PARAMETER(volumeName);
             auto const volumeMountPointNative{ volumeMountPoint.native() };
-            if (0 == volumeMountPointNative.compare(0, std::wstring::npos, fullyQualifiedFileNameNative, 0, volumeMountPointNative.size()))
+            // Paths are case-insensitive; callers may pass normalized lower-case paths
+            auto const length{ static_cast<int>(volumeMountPointNative.size()) };
+            if ((volumeMountPointNative.size() <= fullyQualifiedFileNameNative.size()) &&
+                (CSTR_EQUAL == ::CompareStringOrdinal(volumeMountPointNative.c_str(), length, fullyQualifiedFileNameNative.c_str(), length, TRUE)))
             {
                 // Keep track of the best, most specialized (hence longest) path while iterating
                 if (volumeMountPointNative.size() > result.size()) result = volumeMountPoint;

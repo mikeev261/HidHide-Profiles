@@ -156,6 +156,18 @@ namespace
             auto adopted = saveFailure.AdoptCurrentAsBaseline(); if (!adopted.success || !stored.empty() || clears != 1 || saveFailureCommits) throw std::runtime_error("save-failure explicit adoption did not clear safely");
         }
         {
+            // JSON Allowed apps are normalized to lower case before they reach
+            // the adapter; they must still map to a volume image name.
+            wchar_t temporary[MAX_PATH]{}; if (!::GetTempPathW(MAX_PATH, temporary)) return false;
+            auto withFeeder = desired; withFeeder.allowedApplications.emplace(HidHide::Profiles::NormalizeExecutable(std::filesystem::path(temporary) / L"Feeder.exe"));
+            HidHide::Configuration feederState;
+            CProfilesEnforcementAdapter feederAdapter(IsolatedProfileTestTransport(ProfilesDriverTransport{
+                [&] { return feederState; }, [&](auto const&, auto const& requested) { HidHide::SetDriverState(feederState, requested); }, false }));
+            auto feederApplied = feederAdapter.Reconcile(withFeeder);
+            if (!feederApplied.success || !(feederApplied.observed == withFeeder) || feederState.whitelist.size() != 1)
+                throw std::runtime_error("a normalized Allowed app could not be applied to the driver");
+        }
+        {
             HidHide::Configuration opaqueState; opaqueState.whitelist.emplace(L"\\Device\\DefinitelyMissingVolume\\opaque.exe");
             CProfilesEnforcementAdapter opaque(IsolatedProfileTestTransport(ProfilesDriverTransport{ [&] { return opaqueState; }, [](auto const&, auto const&) {}, false }));
             auto observation = opaque.Observe(); if (observation.success || observation.observedKnown) throw std::runtime_error("opaque Allowed-app observation was called verified");

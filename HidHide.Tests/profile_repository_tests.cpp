@@ -5,6 +5,7 @@
 #include "ProfileRecovery.h"
 #include "ProfileProcessLifetime.h"
 #include "FilterDriverProxy.h"
+#include "Volume.h"
 #include <future>
 #include <iostream>
 
@@ -975,6 +976,17 @@ TEST(ProfileEnforcement, DedupReobservesAndRepairsExternalChange)
     ASSERT_TRUE(adapter.Reconcile(desired).success); EXPECT_EQ(1u, fake.writes);
     ASSERT_TRUE(adapter.Reconcile(desired).success); EXPECT_EQ(1u, fake.writes); EXPECT_EQ(1u, fake.observations);
     fake.observation.observed.hiddenDevices.clear(); ASSERT_TRUE(adapter.Reconcile(desired).success); EXPECT_EQ(2u, fake.writes); EXPECT_EQ(2u, fake.observations);
+}
+
+TEST(ProfileEnforcement, NormalizedAllowedAppMapsToVolumeImageName)
+{
+    // JSON Allowed apps are stored lower-case; Windows mount points are not.
+    wchar_t temporary[MAX_PATH]{}; ASSERT_TRUE(::GetTempPathW(MAX_PATH, temporary));
+    auto original = std::filesystem::path(temporary) / L"Feeder.exe"; auto normalized = NormalizeExecutable(original);
+    auto expected = HidHide::FileNameToFullImageName(original); ASSERT_FALSE(expected.empty());
+    auto image = HidHide::FileNameToFullImageName(normalized); ASSERT_FALSE(image.empty());
+    EXPECT_EQ(0, _wcsicmp(expected.c_str(), image.c_str()));
+    EXPECT_EQ(normalized, NormalizeExecutable(HidHide::FullImageNameToFileName(image)));
 }
 
 TEST(ProfileEnforcement, CoordinatorProxyStartupRefreshDoesNotRequireLegacyCatalog)
