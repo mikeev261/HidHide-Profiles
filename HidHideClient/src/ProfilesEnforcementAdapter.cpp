@@ -87,6 +87,30 @@ namespace
         return std::nullopt;
     }
 
+    // Keeps each element's baseline membership unless the adopted set differs
+    // from what HidHide Profiles applied for that element.
+    template <typename Set>
+    Set AdoptExternalElements(Set const& baseline, Set const& applied, Set const& adopted)
+    {
+        auto result = baseline;
+        for (auto const& item : applied) if (!adopted.count(item)) result.erase(item);
+        for (auto const& item : adopted) if (!applied.count(item)) result.insert(item);
+        return result;
+    }
+
+    // Accepts only what changed outside HidHide Profiles: the applied profile
+    // hiding never becomes the baseline that exit and recovery restore.
+    HidHide::DriverConfiguration AdoptExternalChanges(HidHide::DriverConfiguration const& baseline,
+        HidHide::DriverConfiguration const& applied, HidHide::DriverConfiguration const& adopted)
+    {
+        auto result = baseline;
+        if (adopted.active != applied.active) result.active = adopted.active;
+        if (adopted.inverse != applied.inverse) result.inverse = adopted.inverse;
+        result.blacklist = AdoptExternalElements(baseline.blacklist, applied.blacklist, adopted.blacklist);
+        result.whitelist = AdoptExternalElements(baseline.whitelist, applied.whitelist, adopted.whitelist);
+        return result;
+    }
+
     ProfilesDriverTransport ProductionTransport()
     {
         return ProfilesDriverTransport{
@@ -223,10 +247,27 @@ HidHide::Profiles::EnforcementResult CProfilesEnforcementAdapter::AdoptCurrentAs
         // Translation is part of verification. Never destroy recovery evidence
         // before proving the full observed tuple can be represented faithfully.
         auto neutral = ToNeutral(adopted);
+        if (m_RecoveryBaseline)
+        {
+            auto baseline = AdoptExternalChanges(*m_RecoveryBaseline, m_RecoveryAfter, adopted);
+            if (baseline != adopted)
+            {
+                // The driver still holds profile hiding. Replace the evidence
+                // rather than clearing it, so a crash still restores the
+                // original baseline plus the accepted external change.
+                if (m_Transport.persistentRecovery)
+                {
+                    try { m_Transport.saveRecovery(HidHide::ProfileRecovery::SerializeV2(HidHide::Channel::CurrentSid(), { baseline, adopted, adopted })); }
+                    catch (...) { m_RecoveryBlocked = true; throw; }
+                }
+                m_RecoveryPending = true; m_RecoveryBlocked = false; m_RecoveryAfter = adopted; m_RecoveryBaseline = baseline;
+                m_Baseline = std::move(baseline); m_Expected = adopted; m_Conflict = false; m_ExternalRequest.reset(); return { true, true, std::move(neutral), {} };
+            }
+        }
         if (m_RecoveryBlocked && m_Transport.persistentRecovery && m_Transport.clearBlockedRecovery)
             m_Transport.clearBlockedRecovery();
         else if (m_RecoveryPending || m_RecoveryBlocked) ClearRecovery();
-        m_RecoveryPending = false; m_RecoveryBlocked = false; m_RecoveryAfter = {};
+        m_RecoveryPending = false; m_RecoveryBlocked = false; m_RecoveryAfter = {}; m_RecoveryBaseline.reset();
         m_Baseline = adopted; m_Expected = adopted; m_Conflict = false; m_ExternalRequest.reset(); return { true, true, std::move(neutral), {} };
     }
     catch (...) { if (m_RecoveryBlocked) m_Conflict = true; return Failure(L"Current driver settings could not be adopted", true, m_Conflict || m_RecoveryBlocked); }
@@ -240,7 +281,7 @@ void CProfilesEnforcementAdapter::Recover()
         if (m_Transport.legacyRecoveryPending && m_Transport.legacyRecoveryPending())
             throw std::runtime_error("Legacy driver recovery evidence requires explicit review");
         auto bytes = m_Transport.loadRecovery(); if (!bytes) return; m_RecoveryPending = true;
-        auto record = HidHide::ProfileRecovery::Parse(*bytes, HidHide::Channel::CurrentSid()); auto current = m_Expected; m_RecoveryAfter = record.after;
+        auto record = HidHide::ProfileRecovery::Parse(*bytes, HidHide::Channel::CurrentSid()); auto current = m_Expected; m_RecoveryAfter = record.after; m_RecoveryBaseline = record.baseline;
         if (!HidHide::ProfileRecovery::MatchesRecordedDriverState(current, record.baseline, record.before, record.after)) throw std::runtime_error("Driver recovery record does not match observed state");
         HidHide::Maintenance::Admission admission(m_Transport.admissionName.c_str(), m_Transport.barrierName.c_str()); if (current != record.baseline) Commit(current, record.baseline);
         auto confirmed = HidHide::DriverState(Read()); if (confirmed != record.baseline) throw std::runtime_error("Recovered baseline was not confirmed");
@@ -251,14 +292,18 @@ void CProfilesEnforcementAdapter::Recover()
 
 void CProfilesEnforcementAdapter::SaveRecovery(HidHide::DriverConfiguration const& before, HidHide::DriverConfiguration const& after)
 {
-    m_RecoveryAfter = after;
-    if (!m_Transport.persistentRecovery) { m_RecoveryPending = true; return; }
-    auto bytes = HidHide::ProfileRecovery::SerializeV2(HidHide::Channel::CurrentSid(), { m_Baseline, before, after });
-    try { m_Transport.saveRecovery(bytes); m_RecoveryPending = true; }
-    catch (...) { m_RecoveryBlocked = true; m_Conflict = true; throw; }
+    if (m_Transport.persistentRecovery)
+    {
+        auto bytes = HidHide::ProfileRecovery::SerializeV2(HidHide::Channel::CurrentSid(), { m_Baseline, before, after });
+        // On failure nothing was committed, so the previous in-process pair
+        // still describes what the driver holds and remains the evidence.
+        try { m_Transport.saveRecovery(bytes); }
+        catch (...) { m_RecoveryBlocked = true; m_Conflict = true; throw; }
+    }
+    m_RecoveryPending = true; m_RecoveryAfter = after; m_RecoveryBaseline = m_Baseline;
 }
 
-void CProfilesEnforcementAdapter::ClearRecovery() { if (m_Transport.persistentRecovery) m_Transport.clearRecovery(); m_RecoveryPending = false; m_RecoveryBlocked = false; m_RecoveryAfter = {}; }
+void CProfilesEnforcementAdapter::ClearRecovery() { if (m_Transport.persistentRecovery) m_Transport.clearRecovery(); m_RecoveryPending = false; m_RecoveryBlocked = false; m_RecoveryAfter = {}; m_RecoveryBaseline.reset(); }
 
 HidHide::Configuration CProfilesEnforcementAdapter::PrepareMaintenance()
 {

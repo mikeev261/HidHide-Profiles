@@ -36,8 +36,16 @@ last. IOCTLs are not atomic. Cached confirmed state advances only after read-bac
 Unexpected state during an override or pending recovery latches a conflict. The
 manager stops reconciliation, rejects CLI writes, and retains recovery data. The
 tray offers an explicit action to accept actual driver settings as the new baseline
-and remain paused. This action gives up the prior restoration claim; it does not
-write the old baseline over external edits. Ordinary external edits when no override
+and remain paused. This action does not write the old baseline over external edits.
+When a trustworthy record of what HidHide Profiles applied exists (in-process, or a
+parseable same-user recovery record even if it no longer matches the driver), only
+what changed outside HidHide Profiles is accepted: each driver flag, and each
+blacklist or whitelist entry, takes the observed value where it differs from what
+was applied and otherwise keeps the original baseline. Profile hiding therefore
+never becomes the baseline, and the recovery record is replaced, not cleared, while
+the driver still holds it. Without such a record (legacy, unreadable or foreign
+evidence) the observed settings become the baseline as a whole and the prior
+restoration claim is given up. Ordinary external edits when no override
 or recovery is pending are adopted as baseline. An exit requesting restoration
 stays resident and reports an error if restoration cannot be confirmed.
 

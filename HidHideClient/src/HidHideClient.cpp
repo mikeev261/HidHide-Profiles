@@ -86,6 +86,59 @@ namespace
         return transport;
     }
 
+    // Accepting an external change while a profile hides devices adopts only
+    // what changed outside HidHide Profiles. The profile's own hiding never
+    // becomes the baseline, in process or after a restart, and a crash right
+    // after adoption still recovers the original baseline.
+    void ExerciseAdoptionKeepsOriginalBaseline(HidHide::Profiles::DesiredEnforcement const& desired)
+    {
+        // The feeder is on an unmounted volume, so JSON policy keeps it as is.
+        std::wstring const feederImage{ L"\\Device\\DefinitelyMissingVolume\\AdoptedFeeder.exe" };
+        std::wstring const externalDevice{ L"HID\\EXTERNAL\\ADDED" };
+        for (bool restart : { false, true }) for (bool crashAfterAdoption : { false, true })
+        {
+            HidHide::Configuration adoptState; std::optional<std::vector<std::uint8_t>> stored;
+            auto transport = IsolatedProfileTestTransport(ProfilesDriverTransport{
+                [&] { return adoptState; },
+                [&](auto const& expected, auto const& requested)
+                {
+                    if (HidHide::DriverState(adoptState) != expected) throw std::runtime_error("test transport CAS mismatch");
+                    HidHide::SetDriverState(adoptState, requested);
+                }, true,
+                [&] { return stored; }, [&](auto const& bytes) { stored = bytes; }, [&] { stored.reset(); } });
+            auto requireOriginalBaselineWithExternalChange = [&](char const* message)
+            {
+                if (adoptState.active || adoptState.inverse || adoptState.blacklist.size() != 1 || !adoptState.blacklist.count(externalDevice)
+                    || adoptState.whitelist.size() != 1 || !adoptState.whitelist.count(feederImage) || stored)
+                    throw std::runtime_error(message);
+            };
+            auto running = std::make_unique<CProfilesEnforcementAdapter>(transport);
+            if (!running->Reconcile(desired).success || !stored) throw std::runtime_error("profile hiding was not applied with recovery evidence");
+            auto external = adoptState; external.whitelist.emplace(feederImage); external.blacklist.emplace(externalDevice);
+            running->CommitExternalRequest(adoptState, external);
+            if (running->Observe().success) throw std::runtime_error("an external driver change was not reported as a conflict");
+            if (restart)
+            {
+                running.reset(); running = std::make_unique<CProfilesEnforcementAdapter>(transport);
+                if (running->Observe().success || !stored) throw std::runtime_error("mismatched recovery evidence did not block the restarted runtime");
+            }
+            auto adopted = running->AdoptCurrentAsBaseline();
+            if (!adopted.success || !adoptState.active || !adoptState.blacklist.count(L"HID\\EXACT\\ONE")) throw std::runtime_error("external driver change could not be adopted");
+            if (crashAfterAdoption)
+            {
+                running.reset(); running = std::make_unique<CProfilesEnforcementAdapter>(transport);
+                if (!running->Observe().success) throw std::runtime_error("recovery after adoption did not resolve");
+                requireOriginalBaselineWithExternalChange("crash recovery after adoption kept profile hiding as baseline");
+                // Re-apply the profile over the recovered baseline before exit.
+                auto reapplied = running->Reconcile(desired);
+                if (!reapplied.success || !adoptState.active || !adoptState.blacklist.count(L"HID\\EXACT\\ONE") || !adoptState.whitelist.count(feederImage))
+                    throw std::runtime_error("profile could not be re-applied after adoption");
+            }
+            if (!running->RestoreBaseline().success) throw std::runtime_error("baseline restoration after adoption failed");
+            requireOriginalBaselineWithExternalChange(restart ? "adoption after restart made profile hiding the baseline" : "adoption made profile hiding the baseline");
+        }
+    }
+
     bool ExerciseProductionEnforcementAdapter()
     {
         ProfilesDriverTransport defaults;
@@ -249,6 +302,7 @@ namespace
             bool refused{}; try { cli.CommitExternalRequest(cliState, third); } catch (std::runtime_error const&) { refused = true; }
             if (!refused || cliState.whitelist.size() != 2) throw std::runtime_error("a CLI request over an unrelated external change was accepted");
         }
+        ExerciseAdoptionKeepsOriginalBaseline(desired);
         {
             HidHide::Configuration legacyState; bool legacyPending{ true }; unsigned writes{}, clears{};
             std::map<std::wstring, std::vector<std::uint8_t>> evidence{

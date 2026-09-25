@@ -48,5 +48,8 @@ private:
     ProfilesDriverTransport m_Transport;
     HidHide::DriverConfiguration m_Baseline, m_Expected, m_RecoveryAfter;
     bool m_RecoveryPending{}, m_RecoveryBlocked{}, m_Conflict{};
+    // Baseline recorded together with m_RecoveryAfter (what HidHide Profiles
+    // applied). Set only while that pair is trustworthy evidence.
+    std::optional<HidHide::DriverConfiguration> m_RecoveryBaseline;
     std::optional<HidHide::DriverConfiguration> m_ExternalRequest; // last CLI-requested state
 };
