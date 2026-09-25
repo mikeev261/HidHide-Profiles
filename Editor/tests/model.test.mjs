@@ -1,7 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {createRequire} from 'node:module';
-import {makeDraft,dirty,visibility,setVisibility,devicesFor,deviceRows,filterDeviceRows,validation,pendingCount,duplicateName} from '../src/model.ts';
+import {makeDraft,dirty,visibility,setVisibility,devicesFor,deviceRows,filterDeviceRows,validation,pendingCount,duplicateName,adoptionExpectedSettings} from '../src/model.ts';
 const fixture=createRequire(import.meta.url)('../electron/fixture.cjs');
 test('draft edits never mutate applied snapshot; grouped mixed identities stay explicit',()=>{
  const s=fixture.control({reset:true});const d=makeDraft(s.profiles[1],s);assert.equal(dirty(d),false);
@@ -186,4 +186,11 @@ test('duplicateName truncates at the boundary, preserves short names, and handle
  // Verify no broken surrogates: every char before ' copy' should be valid
  const prefix=emojiResult.slice(0,-' copy'.length);
  assert.ok(!/[\uD800-\uDBFF]$/.test(prefix),'must not end with a dangling high surrogate');
+});
+test('adoption without saved settings is offered only for a missing catalog',()=>{
+ const s=fixture.control({reset:true});assert.deepEqual(adoptionExpectedSettings(s),s.settingsVersion);
+ assert.deepEqual(adoptionExpectedSettings({...s,catalogUninitialized:true}),s.settingsVersion);
+ assert.equal(adoptionExpectedSettings({...s,settingsVersion:null,catalogUninitialized:true}),null);
+ assert.equal(adoptionExpectedSettings({...s,settingsVersion:null,catalogUninitialized:false}),undefined);
+ assert.equal(adoptionExpectedSettings({...s,settingsVersion:null}),undefined);
 });

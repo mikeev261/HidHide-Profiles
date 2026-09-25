@@ -65,6 +65,8 @@ public:
     void SetNotificationWindow(HWND window, UINT message) { std::lock_guard<std::mutex> lock(m_WorkerMutex); m_NotifyWindow = window; m_NotifyMessage = message; }
     void ExitSafely();
     std::set<std::filesystem::path> AdoptExternalState();
+    bool CatalogUninitialized() const;
+    std::set<std::filesystem::path> AdoptExternalStateForNewCatalog();
     ApplyOutcome CompleteAdoptionWithoutSettingsChange(std::set<std::filesystem::path> const& observedAllowedApplications);
     ApplyOutcome AbandonAdoptionDraft();
     bool AdoptionAwaitingSave() const { return m_AdoptedNeedsApply; }

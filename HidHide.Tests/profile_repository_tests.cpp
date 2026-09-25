@@ -603,6 +603,43 @@ TEST(ProfileAcceptance, UnknownFreshObservationCreatesNoAuthoritativeCatalog)
     }
 }
 
+// Stale driver recovery evidence (for example a legacy companion transaction)
+// on a machine without a catalog must not lock the engine: the catalog cannot
+// be seeded from a conflicting observation, so explicit adoption has to be
+// possible while the catalog is uninitialized, and then seed it.
+TEST(ProfileAcceptance, FreshConflictCanBeAdoptedAndSeedsTheCatalog)
+{
+    TempDirectory temp; temp.path = std::filesystem::path(temp.path.parent_path()) / (L"HidHide-Profiles-Restart-Test-" + NewStableId());
+    auto token = NewStableId(); auto readyName = L"Local\\HidHide.FreshConflict.Ready." + token;
+    auto commandName = L"Local\\HidHide.FreshConflict.Command." + token; auto completedName = L"Local\\HidHide.FreshConflict.Completed." + token;
+    HANDLE ready = ::CreateEventW(nullptr, TRUE, FALSE, readyName.c_str()); HANDLE command = ::CreateEventW(nullptr, TRUE, FALSE, commandName.c_str());
+    HANDLE completed = ::CreateEventW(nullptr, TRUE, FALSE, completedName.c_str()); ASSERT_TRUE(ready && command && completed);
+    auto worker = StartRestartWorker(L"conflict-fresh-adopt", temp.path, readyName, commandName, completedName);
+    // A failing worker signals only completion and leaves its reason behind.
+    ASSERT_EQ(WAIT_OBJECT_0, ::WaitForSingleObject(completed, 10000)); std::string failure; std::error_code ignored;
+    if (std::filesystem::exists(temp.path / L".acceptance-error.txt", ignored)) failure = ReadBytes(temp.path / L".acceptance-error.txt");
+    ASSERT_TRUE(failure.empty()) << failure; ASSERT_EQ(WAIT_OBJECT_0, ::WaitForSingleObject(ready, 0));
+    ASSERT_TRUE(::SetEvent(command)); worker.WaitAndVerifyExit();
+    auto loaded = ProfileRepository(temp.path).Load(); EXPECT_TRUE(loaded.issues.empty());
+    EXPECT_EQ(1u, loaded.snapshot.profiles.size()); EXPECT_EQ(1u, loaded.snapshot.settings.allowedApplications.size());
+    ::CloseHandle(ready); ::CloseHandle(command); ::CloseHandle(completed);
+}
+
+TEST(ProfileAcceptance, IncompleteCatalogConflictIsNotSeededByAdoption)
+{
+    TempDirectory temp; temp.path = std::filesystem::path(temp.path.parent_path()) / (L"HidHide-Profiles-Restart-Test-" + NewStableId());
+    ProfileRepository setup(temp.path); setup.OpenOrCreate(); std::filesystem::remove(temp.path / L"settings.json");
+    auto before = AllRepositoryFileBytes(temp.path); ASSERT_EQ(1u, before.size());
+    auto token = NewStableId(); auto readyName = L"Local\\HidHide.IncompleteConflict.Ready." + token;
+    auto commandName = L"Local\\HidHide.IncompleteConflict.Command." + token; auto completedName = L"Local\\HidHide.IncompleteConflict.Completed." + token;
+    HANDLE ready = ::CreateEventW(nullptr, TRUE, FALSE, readyName.c_str()); HANDLE command = ::CreateEventW(nullptr, TRUE, FALSE, commandName.c_str());
+    HANDLE completed = ::CreateEventW(nullptr, TRUE, FALSE, completedName.c_str()); ASSERT_TRUE(ready && command && completed);
+    auto worker = StartRestartWorker(L"conflict-incomplete", temp.path, readyName, commandName, completedName);
+    ASSERT_EQ(WAIT_OBJECT_0, ::WaitForSingleObject(ready, 10000)); ASSERT_EQ(WAIT_OBJECT_0, ::WaitForSingleObject(completed, 10000));
+    EXPECT_EQ(before, AllRepositoryFileBytes(temp.path)); ASSERT_TRUE(::SetEvent(command)); worker.WaitAndVerifyExit();
+    EXPECT_EQ(before, AllRepositoryFileBytes(temp.path)); ::CloseHandle(ready); ::CloseHandle(command); ::CloseHandle(completed);
+}
+
 TEST(ProfileAcceptance, HardRecoveryFailuresBlockServiceAndPreserveAllEvidence)
 {
     for (int scenario : { 0, 1, 2 })
