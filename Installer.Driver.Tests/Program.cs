@@ -251,6 +251,8 @@ Reject(() => crashRecovery.Rollback(), "reloaded inverse intent cannot restart")
 Reject(() => crashRecovery.ResumeAfterReboot("3"), "reloaded inverse intent cannot resume");
 Check(crashUndo.Calls.Count == crashCalls, "completion-write crash does not replay native inverse");
 Console.WriteLine($"{checks} driver transaction checks passed.");
+try { Console.WriteLine($"{ProtectedDirectoryChecks.Run()} protected directory checks passed."); }
+catch (Exception error) { Console.WriteLine("PROTECTED DIRECTORY CHECK FAILED: " + error.Message); throw; }
 
 sealed class MemoryJournal : ITransactionJournal {
  public int Writes; public int FailWrite;

@@ -28,7 +28,7 @@ public sealed class ProtectedJournal : ITransactionJournal
     }
     // Called only by the future elevated setup controller, never from MSI public
     // properties or an ordinary-user READY record. No caller-supplied paths.
-    public static void CreateRoot()
+    public static void CreateRoot(Action<string>? log = null)
     {
         RequireAdministrator();
         string current = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
@@ -36,17 +36,63 @@ public sealed class ProtectedJournal : ITransactionJournal
         foreach (var part in new[] { "mikeev261", "HidHide", "Maintenance" })
         {
             current = Path.Combine(current, part);
-            if (!Directory.Exists(current))
-            {
-                var acl = new DirectorySecurity(); acl.SetAccessRuleProtection(true, false); acl.SetOwner(Admins);
-                foreach (var sid in new[] { Admins, System })
-                    acl.AddAccessRule(new FileSystemAccessRule(sid, FileSystemRights.FullControl,
-                        InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
-                Directory.CreateDirectory(current, acl);
-            }
+            EnsureProtectedDirectory(current, Trusted, CreateProtected, aside => log?.Invoke("An untrusted pre-existing maintenance path was moved aside and preserved: " + aside));
             ValidateDirectory(current);
         }
     }
+    static bool ValidateAndTrue(string path) { ValidateDirectory(path); return true; }
+    static bool Trusted(string path)
+    {
+        try { return (File.GetAttributes(path) & FileAttributes.Directory) != 0 && ValidateAndTrue(path); }
+        catch (UnauthorizedAccessException) { return false; }
+    }
+    // Creates the directory with the protected ACL atomically. Returns false if
+    // anything already exists at the path, so a racing creator is never adopted.
+    static bool CreateProtected(string path)
+    {
+        var acl = new DirectorySecurity(); acl.SetAccessRuleProtection(true, false); acl.SetOwner(Admins);
+        foreach (var sid in new[] { Admins, System })
+            acl.AddAccessRule(new FileSystemAccessRule(sid, FileSystemRights.FullControl,
+                InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
+        var descriptor = acl.GetSecurityDescriptorBinaryForm();
+        var memory = Marshal.AllocHGlobal(descriptor.Length);
+        try
+        {
+            Marshal.Copy(descriptor, 0, memory, descriptor.Length);
+            var attributes = new SecurityAttributes { Length = Marshal.SizeOf<SecurityAttributes>(), Descriptor = memory };
+            if (CreateDirectoryW(path, ref attributes)) return true;
+            int error = Marshal.GetLastWin32Error();
+            if (error == 183) return false; // ERROR_ALREADY_EXISTS
+            throw new System.ComponentModel.Win32Exception(error, "Cannot create protected maintenance directory.");
+        }
+        finally { Marshal.FreeHGlobal(memory); }
+    }
+    // Any user may create a child of ProgramData. A path that is not a trusted
+    // protected directory (a user-owned directory, a file or a reparse point) is
+    // moved aside, never deleted or followed, and preserved as evidence; a new
+    // protected directory is created in its place. Administrators may rename any
+    // ProgramData child whatever its own ACL. A trusted directory is kept as is.
+    public static void EnsureProtectedDirectory(string path, Func<string, bool> trusted, Func<string, bool> createProtected, Action<string> movedAside)
+    {
+        for (int attempt = 0; attempt < 3; attempt++)
+        {
+            bool exists;
+            try { _ = File.GetAttributes(path); exists = true; }
+            catch (FileNotFoundException) { exists = false; }
+            catch (DirectoryNotFoundException) { exists = false; }
+            if (!exists) { if (createProtected(path) && trusted(path)) return; continue; }
+            if (trusted(path)) return;
+            string aside = path + ".untrusted-" + Guid.NewGuid().ToString("N");
+            if (!MoveFileExW(path, aside, 0))
+                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "An untrusted maintenance path is in use and could not be moved aside: " + path);
+            movedAside(aside);
+        }
+        throw new UnauthorizedAccessException("Maintenance directory could not be secured: " + path);
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    struct SecurityAttributes { public int Length; public IntPtr Descriptor; public int Inherit; }
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
+    static extern bool CreateDirectoryW(string path, ref SecurityAttributes attributes);
     public static void RejectReparsePath(string path)
     {
         var current = Path.GetFullPath(path);
