@@ -72,6 +72,21 @@ namespace
         catch (...) { ::RegCloseKey(key); throw; }
     }
 
+    // A driver Allowed-app entry is policy input only when it maps to a local
+    // absolute .exe path. Any other entry (for example a feeder on a volume that
+    // is not mounted) is preserved exactly by ToDriver and never edited;
+    // driver-level comparison still detects any external change to it.
+    std::optional<std::filesystem::path> AllowedApplicationPath(HidHide::FullImageName const& image)
+    {
+        try
+        {
+            auto path = HidHide::FullImageNameToFileName(image);
+            if (!path.empty()) return HidHide::Profiles::NormalizeExecutable(path);
+        }
+        catch (...) {}
+        return std::nullopt;
+    }
+
     ProfilesDriverTransport ProductionTransport()
     {
         return ProfilesDriverTransport{
@@ -105,15 +120,7 @@ HidHide::Profiles::DesiredEnforcement CProfilesEnforcementAdapter::ToNeutral(Hid
 {
     HidHide::Profiles::DesiredEnforcement result; result.hidingEnabled = state.active; result.hiddenDevices = state.blacklist;
     for (auto const& image : state.whitelist)
-    {
-        try
-        {
-            auto path = HidHide::FullImageNameToFileName(image);
-            if (path.empty()) throw std::runtime_error("Driver Allowed-app entry cannot be represented as a local executable path");
-            result.allowedApplications.emplace(HidHide::Profiles::NormalizeExecutable(path));
-        }
-        catch (...) { throw std::runtime_error("Driver Allowed-app state contains an opaque entry; exact observation is unavailable"); }
-    }
+        if (auto path = AllowedApplicationPath(image)) result.allowedApplications.emplace(std::move(*path));
     return result;
 }
 
@@ -124,7 +131,7 @@ HidHide::DriverConfiguration CProfilesEnforcementAdapter::ToDriver(HidHide::Prof
     {
         auto image = HidHide::FileNameToFullImageName(path); if (image.empty()) throw std::runtime_error("Allowed application is not on a supported local volume"); result.whitelist.emplace(std::move(image));
     }
-    for (auto const& image : m_Baseline.whitelist) try { if (HidHide::FullImageNameToFileName(image).empty()) result.whitelist.emplace(image); } catch (...) { result.whitelist.emplace(image); }
+    for (auto const& image : m_Baseline.whitelist) if (!AllowedApplicationPath(image)) result.whitelist.emplace(image);
     return result;
 }
 
