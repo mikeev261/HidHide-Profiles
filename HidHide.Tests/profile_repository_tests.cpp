@@ -782,6 +782,25 @@ TEST(ProfileRepository, CrossProcessWriterLeaseSerializesApplyAndPreservesCas)
     ::CloseHandle(ready); ::CloseHandle(command); ::CloseHandle(completed);
 }
 
+TEST(ProfileRepository, WriterLeaseCannotBeSquattedThroughAGlobalName)
+{
+    // #19: another user could pre-create the predictable Global mutex name,
+    // computed from this user's repository path, and deny access to it.
+    TempDirectory temp; ProfileRepository repository(temp.path); repository.OpenOrCreate();
+    auto canonical = std::filesystem::absolute(temp.path).lexically_normal().native();
+    std::transform(canonical.begin(), canonical.end(), canonical.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+    std::uint64_t fnv{ 1469598103934665603ull }; for (auto c : canonical) { fnv ^= static_cast<std::uint16_t>(c); fnv *= 1099511628211ull; }
+    std::wostringstream name; name << L"Global\\HidHide.Profiles.Repository." << std::hex << fnv;
+    PSECURITY_DESCRIPTOR descriptor{}; ASSERT_TRUE(::ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;GA;;;SY)", SDDL_REVISION_1, &descriptor, nullptr));
+    SECURITY_ATTRIBUTES attributes{ sizeof(attributes), descriptor, FALSE };
+    HANDLE squat = ::CreateMutexW(&attributes, TRUE, name.str().c_str()); ::LocalFree(descriptor); ASSERT_TRUE(squat);
+    LoadResult loaded; EXPECT_NO_THROW(loaded = repository.Load()); EXPECT_TRUE(loaded.issues.empty());
+    auto id = NewStableId(); EXPECT_NO_THROW(repository.Apply(App(id, L"Unblocked", 0, L"C:\\unblocked.exe"), std::nullopt));
+    ::ReleaseMutex(squat); ::CloseHandle(squat);
+    // The lease leaves nothing behind in the repository once released.
+    for (auto const& entry : std::filesystem::directory_iterator(temp.path)) EXPECT_EQ(L".json", entry.path().extension().native()) << Json::ToUtf8(entry.path().filename().native());
+}
+
 TEST(ProfileRepository, ExportBackupCollisionTraversalAndLockedTargetAreSafe)
 {
     TempDirectory temp; ProfileRepository repository(temp.path); repository.OpenOrCreate(); auto id = NewStableId();
