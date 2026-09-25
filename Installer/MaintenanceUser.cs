@@ -58,7 +58,12 @@ internal sealed class MaintenanceUser : IDisposable
         return Start(cli, (uninstall ? "--maintenance-msi-uninstall " : "--maintenance-msi ") + id.ToString("D"), out errors);
     }
 
-    internal Process Start(string executable, string arguments) => Start(executable, arguments, out _);
+    internal Process Start(string executable, string arguments)
+    {
+        var result = Start(executable, arguments, out var errors);
+        errors.Dispose();
+        return result;
+    }
 
     // Internal seam also used by the isolated token probe. Production supplies
     // only the fixed installed CLI and a generated transaction GUID above.
@@ -74,7 +79,7 @@ internal sealed class MaintenanceUser : IDisposable
         bool resumed = false;
         try
         {
-            if (!CreatePipe(out errorRead, out errorWrite, IntPtr.Zero, 0) || !SetHandleInformation(errorWrite, 1, 1))
+            if (!CreatePipe(out errorRead, out errorWrite, IntPtr.Zero, 65536) || !SetHandleInformation(errorWrite, 1, 1))
                 throw Error("Create maintenance diagnostics pipe");
             IntPtr size = IntPtr.Zero;
             InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref size);
@@ -92,7 +97,8 @@ internal sealed class MaintenanceUser : IDisposable
             if (!RevertToSelf()) throw Error("Enter MSI server process context");
             try
             {
-                // STARTF_USESTDHANDLES: only stderr is connected, to the diagnostics pipe.
+                // STARTF_USESTDHANDLES: only stderr is connected, to the diagnostics
+                // pipe; stdin and stdout are null (the MSI helper never uses them).
                 var startup = new StartupInfo { Size = Marshal.SizeOf(typeof(StartupInfo)), Desktop = @"winsta0\default",
                     Flags = 0x100, Error = errorWrite.DangerousGetHandle() };
                 var extended = new StartupInfoEx { StartupInfo = startup, AttributeList = attributes };
@@ -100,10 +106,21 @@ internal sealed class MaintenanceUser : IDisposable
                 const uint flags = 0x08000404; // NO_WINDOW | UNICODE_ENVIRONMENT | SUSPENDED
                 const uint extendedFlags = flags | 0x00080000; // EXTENDED_STARTUPINFO_PRESENT
                 var command = new StringBuilder("\"" + executable + "\" " + arguments);
-                if (!CreateProcessAsUserW(token, executable, command, IntPtr.Zero, IntPtr.Zero, true, extendedFlags,
-                    environment, Path.GetDirectoryName(executable), ref extended, out child))
+                bool created = CreateProcessAsUserW(token, executable, command, IntPtr.Zero, IntPtr.Zero, true, extendedFlags,
+                    environment, Path.GetDirectoryName(executable), ref extended, out child);
+                int error = created ? 0 : Marshal.GetLastWin32Error();
+                if (!created && error != 1314)
                 {
-                    int error = Marshal.GetLastWin32Error();
+                    // Diagnostics are best effort: if the host cannot hand the
+                    // pipe to the helper, start it exactly as before without one.
+                    var plain = new StartupInfo { Size = Marshal.SizeOf(typeof(StartupInfo)), Desktop = @"winsta0\default" };
+                    command = new StringBuilder("\"" + executable + "\" " + arguments);
+                    created = CreateProcessAsUserW(token, executable, command, IntPtr.Zero, IntPtr.Zero, false, flags,
+                        environment, Path.GetDirectoryName(executable), ref plain, out child);
+                    if (!created) error = Marshal.GetLastWin32Error();
+                }
+                if (!created)
+                {
                     using var processIdentity = WindowsIdentity.GetCurrent();
                     // Interactive elevated hosts lack service privileges. This
                     // API is safe only in the target session (it ignores the
@@ -186,6 +203,7 @@ internal sealed class MaintenanceUser : IDisposable
     [DllImport("userenv.dll", SetLastError = true)] static extern bool CreateEnvironmentBlock(out IntPtr environment, SafeAccessTokenHandle token, bool inherit);
     [DllImport("userenv.dll")] static extern bool DestroyEnvironmentBlock(IntPtr environment);
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool CreateProcessAsUserW(SafeAccessTokenHandle token, string app, StringBuilder command, IntPtr processAttributes, IntPtr threadAttributes, bool inherit, uint flags, IntPtr environment, string? directory, ref StartupInfoEx startup, out ProcessInfo process);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool CreateProcessAsUserW(SafeAccessTokenHandle token, string app, StringBuilder command, IntPtr processAttributes, IntPtr threadAttributes, bool inherit, uint flags, IntPtr environment, string? directory, ref StartupInfo startup, out ProcessInfo process);
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool CreateProcessWithTokenW(SafeAccessTokenHandle token, uint logon, string app, StringBuilder command, uint flags, IntPtr environment, string? directory, ref StartupInfo startup, out ProcessInfo process);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool CreateProcessW(string app, StringBuilder command, IntPtr processAttributes, IntPtr threadAttributes, bool inherit, uint flags, IntPtr environment, string? directory, ref StartupInfoEx startup, out ProcessInfo process);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool CreatePipe(out SafeFileHandle read, out SafeFileHandle write, IntPtr attributes, uint size);
@@ -201,39 +219,50 @@ internal sealed class MaintenanceUser : IDisposable
 // Bounded capture of the helper's stderr. The CLI writes why the resident
 // coordinator refused maintenance there; the text is display-only data from
 // the ordinary-user helper and never selects any elevated behaviour.
-internal sealed class HelperErrorOutput
+// The pipe is only ever polled on the caller's thread: the helper stays alive
+// with its write end open after readiness, and the .NET Framework custom action
+// AppDomain cannot unload while any thread is blocked in a pipe read.
+internal sealed class HelperErrorOutput : IDisposable
 {
-    const int Limit = 4096, ReasonLimit = 512;
-    readonly byte[] buffer = new byte[Limit];
-    readonly Thread reader;
+    const int Limit = 4096, ReasonLimit = 512, ReadsPerDrain = 64;
+    readonly SafeFileHandle pipe;
+    readonly byte[] buffer = new byte[Limit], chunk = new byte[4096];
     int length;
 
-    internal HelperErrorOutput(SafeFileHandle pipe)
+    internal HelperErrorOutput(SafeFileHandle pipe) => this.pipe = pipe;
+
+    // Reads only bytes already in the pipe, so it never blocks. Keeps draining
+    // past the limit so a verbose helper never blocks on a full pipe. Returns
+    // false once the helper's write end is closed and nothing remains.
+    public bool Drain()
     {
-        reader = new Thread(() =>
+        if (pipe.IsClosed) return false;
+        for (int reads = 0; reads < ReadsPerDrain; reads++)
         {
-            try
-            {
-                using var stream = new FileStream(pipe, FileAccess.Read, 1);
-                var chunk = new byte[512];
-                int read;
-                // Keep draining past the limit so a verbose helper never blocks on a full pipe.
-                while ((read = stream.Read(chunk, 0, chunk.Length)) > 0)
-                    lock (buffer) { int copy = Math.Min(read, Limit - length); Array.Copy(chunk, 0, buffer, length, copy); length += copy; }
-            }
-            catch (IOException) { }
-            catch (ObjectDisposedException) { }
-        }) { IsBackground = true, Name = "HidHide maintenance helper stderr" };
-        reader.Start();
+            if (!PeekNamedPipe(pipe, IntPtr.Zero, 0, IntPtr.Zero, out uint available, IntPtr.Zero)) return false;
+            if (available == 0) return true;
+            if (!ReadFile(pipe, chunk, Math.Min(available, (uint)chunk.Length), out uint read, IntPtr.Zero) || read == 0) return false;
+            int copy = Math.Min((int)read, Limit - length);
+            Array.Copy(chunk, 0, buffer, length, copy);
+            length += copy;
+        }
+        return true;
     }
 
     // Waits briefly for the (exited) helper's stream to end, then returns
     // whatever arrived as a single plain line.
     public string Reason(int milliseconds)
     {
-        reader.Join(milliseconds);
-        lock (buffer) return Sanitize(Encoding.UTF8.GetString(buffer, 0, length));
+        var clock = Stopwatch.StartNew();
+        while (Drain() && clock.ElapsedMilliseconds < milliseconds) Thread.Sleep(10);
+        return Sanitize(Encoding.UTF8.GetString(buffer, 0, length));
     }
+
+    // Later helper writes fail harmlessly; the CLI only reports on failure.
+    public void Dispose() => pipe.Dispose();
+
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool PeekNamedPipe(SafeFileHandle pipe, IntPtr buffer, uint size, IntPtr read, out uint available, IntPtr left);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool ReadFile(SafeFileHandle file, byte[] buffer, uint size, out uint read, IntPtr overlapped);
 
     // One line of printable text; brackets and braces are neutralized so the
     // text cannot act as Windows Installer formatting in the error record.
@@ -264,6 +293,7 @@ internal static class HelperReadiness
         var deadline = DateTime.UtcNow + timeout;
         while (DateTime.UtcNow < deadline)
         {
+            errors.Drain();
             if (helper.HasExited)
             {
                 string reason = errors.Reason(1000).TrimEnd('.', ' ');

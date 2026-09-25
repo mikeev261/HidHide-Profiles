@@ -41,6 +41,7 @@ internal static class MaintenanceTokenChecks
             // must surface that reason and must not tell the user to open the app.
             using var refused = user.Start(Path.Combine(AppContext.BaseDirectory, "Installer.Tests.exe"),
                 "--maintenance-user-failing-child", out var refusedErrors);
+            using var refusedCapture = refusedErrors;
             string failure = ReadinessFailure(refused, refusedErrors);
             if (!failure.Contains("(code 1627)") || !failure.Contains("Close the HidHide Profiles editor before running setup. Apply or discard its unsaved changes first"))
                 throw new Exception("Helper refusal reason was not reported: " + failure);
@@ -49,6 +50,7 @@ internal static class MaintenanceTokenChecks
             // Unbounded helper output neither blocks the helper nor the report.
             using var flooding = user.Start(Path.Combine(AppContext.BaseDirectory, "Installer.Tests.exe"),
                 "--maintenance-user-failing-child flood", out var floodingErrors);
+            using var floodingCapture = floodingErrors;
             failure = ReadinessFailure(flooding, floodingErrors);
             if (!failure.Contains("(code 1627)") || failure.Length > 2048) throw new Exception("Flooding helper output was not bounded: " + failure.Length);
             if (HelperErrorOutput.Sanitize("a\u0007[ProgramFilesFolder]\r\n{b}\t\tc") != "a (ProgramFilesFolder) (b) c")
@@ -64,8 +66,8 @@ internal static class MaintenanceTokenChecks
 
     static string ReadinessFailure(Process helper, HelperErrorOutput errors)
     {
-        if (!helper.WaitForExit(15000)) throw new Exception("Refusing helper did not exit.");
-        try { HelperReadiness.Wait(helper, errors, () => false, TimeSpan.FromSeconds(15)); }
+        // The wait itself drains stderr, so a flooding helper can still exit.
+        try { HelperReadiness.Wait(helper, errors, () => { Thread.Sleep(50); return false; }, TimeSpan.FromSeconds(15)); }
         catch (InvalidOperationException error) { return error.Message; }
         throw new Exception("Exited helper was treated as ready.");
     }

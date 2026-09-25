@@ -82,7 +82,8 @@ public static class DirectMsiActions
             int.TryParse(session["CLIENTPROCESSID"], out int clientProcessId);
             using var user = new MaintenanceUser(sid, clientProcessId);
             helper = user.StartMaintenance(id, operation == "uninstall", out var errors);
-            WaitForReady(id, helper, errors);
+            // Released before returning so nothing of this action outlives it.
+            using (errors) WaitForReady(id, helper, errors);
             session[HelperProperty] = helper.Id.ToString(System.Globalization.CultureInfo.InvariantCulture);
             session.Log("HidHide ordinary-user maintenance is ready for protected MSI execution.");
             helper.Dispose(); helper = null;
