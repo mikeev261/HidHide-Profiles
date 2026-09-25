@@ -107,7 +107,7 @@ public static class DirectMsiActions
             bool recovery = Required(session, RecoveryProperty, allowEmpty: true) == "1";
             using var helperProcess = !recovery && helper > 0 ? Process.GetProcessById(helper) : null;
             if (helperProcess != null) _ = helperProcess.Handle;
-            var flow = new DirectMsiFlow(new MachineHost(session));
+            var flow = new DirectMsiFlow(new MachineHost(session, helperProcess));
             if (recovery) flow.ResumePending(id, sid, operation);
             else
             {
@@ -116,7 +116,7 @@ public static class DirectMsiActions
                 PreparePayload();
                 var backend = new WindowsDriverBackend(Path.Combine(ProtectedJournal.Root, "payload"), lease.AssertHeld);
                 var before = backend.Inspect();
-                ValidateStartingState(operation, before);
+                DirectMsiFlow.ValidateStartingState(operation, before);
                 var record = new TransactionRecord
                 {
                     Id = id,
@@ -130,9 +130,6 @@ public static class DirectMsiActions
             }
 
             flow.Apply(id, operation, recovery);
-            SignalRelease(id); // Confirmed checkpoint; helper can remove owned startup on uninstall.
-            if (helperProcess != null && (!helperProcess.WaitForExit(5000) || helperProcess.ExitCode != 0))
-                throw new InvalidOperationException("Configuration maintenance did not finish successfully. Recovery information was retained.");
             session.Log("HidHide protected driver phase completed; Windows Installer owns reboot continuation.");
             return ActionResult.Success;
         }
@@ -203,7 +200,9 @@ public static class DirectMsiActions
     sealed class MachineHost : IDirectMsiHost
     {
         readonly Session session;
-        public MachineHost(Session session) { this.session = session; }
+        readonly Process? helper;
+        public MachineHost(Session session, Process? helper = null) { this.session = session; this.helper = helper; }
+        public bool WaitForHelper(int milliseconds) => helper == null || helper.WaitForExit(milliseconds) && helper.ExitCode == 0;
         public TransactionRecord Load(Guid id) => new ProtectedJournal(id).Load();
         public void Save(TransactionRecord record) => new ProtectedJournal(record.Id).Save(record);
         public int RunWorker(string verb, Guid id) => WorkerProcess.Run(verb, id, session.Log);
@@ -227,14 +226,6 @@ public static class DirectMsiActions
         public void RestoreSettings(DriverSettings expected, DriverSettings desired) => backend.RestoreSettings(expected, desired);
         public void Complete() => lease.Complete();
         public void Dispose() => lease.Dispose();
-    }
-    static void ValidateStartingState(string operation, DriverState state)
-    {
-        if (state.ServicePendingDeletion) throw new DriverRestartRequiredException();
-        if (operation == "install" && !state.CanInstall) throw new InvalidOperationException("A clean installation requires no existing HidHide driver resources.");
-        if (operation == "uninstall" && !state.CoreHealthy) throw new InvalidOperationException("Uninstall requires the installed signed driver to be healthy.");
-        if (operation is "repair" or "upgrade" && !(state.CoreHealthy || operation == "repair" && state.Repairable))
-            throw new InvalidOperationException("The existing driver state is not safe for in-place maintenance.");
     }
     static void WaitForReady(Guid id, Process helper)
     {

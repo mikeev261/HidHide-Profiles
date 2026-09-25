@@ -114,15 +114,20 @@ public sealed class WindowsDriverBackend : IDriverBackend
         }
         var binary = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "drivers", "HidHide.sys");
         using var control = CreateFileW(@"\\.\HidHide", 0x80000000, 0, IntPtr.Zero, 3, 0, IntPtr.Zero);
+        int controlError = control.IsInvalid ? Marshal.GetLastWin32Error() : 0;
         return new DriverState {
             Nodes = nodes.OrderBy(x => x.Id, StringComparer.OrdinalIgnoreCase).ToArray(),
             Packages = packages.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray(),
             Filters = Enumerable.Range(0, 3).Select(Filter).ToArray(), ServiceExists = service != null,
             ServicePendingDeletion = (int?)service?.GetValue("DeleteFlag") == 1,
-            BinaryHash = File.Exists(binary) ? Payload.Hash(binary) : "", ControlAvailable = !control.IsInvalid,
+            BinaryHash = File.Exists(binary) ? Payload.Hash(binary) : "", ControlAvailable = ControlPresent(controlError),
             Settings = control.IsInvalid ? service == null || (int?)service.GetValue("DeleteFlag") == 1 ? null : StoredDriverSettings.FromRegistry() : ReadSettings(control)
         };
     }
+    // The control device is exclusive: while a feeder or the CLI holds it, an
+    // open fails with access denied or a sharing violation. That still proves
+    // the device exists; its settings then come from the persisted registry values.
+    public static bool ControlPresent(int openError) => openError is 0 or 5 or 32;
     static DriverSettings ReadSettings(SafeFileHandle control)
     {
         byte[] Read(uint function, bool list)

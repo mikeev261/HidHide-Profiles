@@ -97,7 +97,7 @@ public sealed partial class DriverTransaction
             throw new InvalidOperationException("Driver state changed after preparation.");
         if (record.Operation == Operation.Install && !state.CanInstall)
             throw new InvalidOperationException("Fresh installation requires empty driver ownership; migrate legacy first.");
-        if (record.Operation != Operation.Install && !(Reconstructing ? state.Repairable : state.CoreHealthy))
+        if (record.Operation != Operation.Install && !(Reconstructing ? state.Repairable : record.Operation == Operation.Uninstall ? state.Removable : state.CoreHealthy))
             throw new InvalidOperationException("Existing resources are not healthy and proven; explicit recovery required.");
         record.Status = JournalStatus.Applying; journal.Save(record);
         try
@@ -186,6 +186,14 @@ public sealed partial class DriverTransaction
         }
         return true;
     }
+
+    // A continuation that already verified the bound driver on this boot and
+    // then only attached class filters may commit; the filters need a restart.
+    public static bool CanCommitAfterResume(TransactionRecord record, DriverState observed, string currentBootId) =>
+        record.Status == JournalStatus.RebootRequired && record.Reboot && !record.RollbackDirection && record.BootId == currentBootId &&
+        record.Operation is Operation.Install or Operation.Repair &&
+        record.Steps.All(x => x.Completed && !x.UndoStarted && !x.Undone) && record.Steps.Any(x => x.Kind == StepKind.Filter) &&
+        observed.Healthy && observed.Settings != null;
 
     public JournalStatus ResumeAfterReboot(string currentBootId)
     {

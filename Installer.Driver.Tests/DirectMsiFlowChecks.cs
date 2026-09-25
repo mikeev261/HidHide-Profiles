@@ -24,7 +24,43 @@ static class DirectMsiFlowChecks
         UpgradeRestoringMissingFilterCommitsAndRestartsAtEnd();
         RepairRestoringMissingFilterStillResumesAfterForcedRestart();
         FinalizeRetryAfterRestoredSettingsCommits();
+        DisabledDriverCanBeUninstalled();
+        ReconstructingRepairWithMissingFilterFinishesInOneAttempt();
+        SlowHelperAfterCompletedUninstallDoesNotFailSetup();
         return checks;
+    }
+
+    // #16: a disabled device (problem 22) has no control device, but it is still
+    // exactly the owned signed driver and must be removable.
+    static void DisabledDriverCanBeUninstalled()
+    {
+        var backend = Fake.Healthy(); backend.State.Nodes[0].Problem = 22; backend.State.ControlAvailable = false;
+        var host = new FlowHost(backend);
+        var run = host.Msi("uninstall");
+        Check(run.Succeeded && host.Marker == null && backend.State.Empty, "disabled driver uninstall: " + run.Failure);
+    }
+
+    // #17: repairing a driver whose binary and one filter are missing needs a
+    // restart after binding; the filter then added must not fail setup.
+    static void ReconstructingRepairWithMissingFilterFinishesInOneAttempt()
+    {
+        var backend = MissingFilter(1); backend.State.BinaryHash = "";
+        backend.State.Settings = new DriverSettings { Active = true, Inverse = false, Whitelist = SettingsCodec.Encode(new[] { "feeder" }), Blacklist = SettingsCodec.Encode(new[] { "device" }) };
+        var baseline = backend.State.Settings;
+        var host = new FlowHost(backend);
+        var run = host.Msi("repair");
+        Check(run.Succeeded && host.Marker == null && host.Last.Status == JournalStatus.Committed, "reconstructing repair with a missing filter: " + run.Failure);
+        Check(host.RestartAtEnd && backend.State.Healthy && backend.State.Settings!.Same(baseline), "repair restores the baseline and asks for the filter restart at the end");
+    }
+
+    // #18: the helper's cleanup after release is not part of the driver
+    // transaction; a slow or failed helper must not fail a completed uninstall.
+    static void SlowHelperAfterCompletedUninstallDoesNotFailSetup()
+    {
+        var host = new FlowHost(Fake.Healthy()) { HelperSucceeds = false };
+        var run = host.Msi("uninstall");
+        Check(run.Succeeded && host.Marker == null && host.Backend.State.Empty, "completed uninstall with a slow helper: " + run.Failure);
+        Check(host.Logs.Any(x => x.Contains("helper")), "a slow helper is logged");
     }
 
     // #12: FinalizeDriver restored the repaired driver's settings but failed
@@ -241,7 +277,7 @@ sealed class FlowHost : IDirectMsiHost
     // Mirrors the fresh-attempt branch of DirectMsiActions.ApplyDriver.
     void Prepare(Guid id, string operation)
     {
-        var before = Backend.Inspect();
+        var before = Backend.Inspect(); DirectMsiFlow.ValidateStartingState(operation, before);
         var record = new TransactionRecord
         {
             Id = id, InitiatingSid = Sid, Before = before, BootId = Boot,
@@ -294,6 +330,8 @@ sealed class FlowHost : IDirectMsiHost
     public void SignalRelease(Guid id) { }
     public void Log(string message) => Logs.Add(message);
     public string CurrentBoot() => Boot;
+    public bool HelperSucceeds = true;
+    public bool WaitForHelper(int milliseconds) => HelperSucceeds;
 
     sealed class Journal : ITransactionJournal
     {

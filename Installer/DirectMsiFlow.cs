@@ -14,6 +14,8 @@ public interface IDirectMsiHost
     IDirectMsiLease OpenLease(Guid id);
     bool MarkerMatches(Guid id);
     string CurrentBoot();
+    // True when no user helper is involved or it exited successfully in time.
+    bool WaitForHelper(int milliseconds);
     void SignalRelease(Guid id);
     void Log(string message);
 }
@@ -78,8 +80,22 @@ public sealed class DirectMsiFlow
             if (applied != 0 && applied != 3010) throw new InvalidOperationException("Driver maintenance failed with exit code " + applied + ".");
         }
         current = host.Load(id);
-        using var lease = host.OpenLease(id);
-        lease.MarkPending(operation, DirectMsiPolicy.RequiresRestart(operation, recovery, current.Reboot));
+        using (var lease = host.OpenLease(id))
+            lease.MarkPending(operation, DirectMsiPolicy.RequiresRestart(operation, recovery, current.Reboot));
+        host.SignalRelease(id); // Confirmed checkpoint; helper can remove owned startup on uninstall.
+        // After this checkpoint the helper only removes owned startup entries;
+        // the driver change is complete and cannot be undone by MSI rollback.
+        if (!host.WaitForHelper(30000))
+            host.Log("HidHide configuration helper did not finish its post-maintenance cleanup; the driver phase is complete. A stale startup entry may remain.");
+    }
+
+    public static void ValidateStartingState(string operation, DriverState state)
+    {
+        if (state.ServicePendingDeletion) throw new DriverRestartRequiredException();
+        if (operation == "install" && !state.CanInstall) throw new InvalidOperationException("A clean installation requires no existing HidHide driver resources.");
+        if (operation == "uninstall" && !state.Removable) throw new InvalidOperationException("Uninstall requires the installed signed driver.");
+        if (operation is "repair" or "upgrade" && !(state.CoreHealthy || operation == "repair" && state.Repairable))
+            throw new InvalidOperationException("The existing driver state is not safe for in-place maintenance.");
     }
 
     // Returns true when Windows must restart at the end of setup.
@@ -88,17 +104,20 @@ public sealed class DirectMsiFlow
         var record = host.Load(id);
         // Without an intervening restart (upgrades never force one) a
         // continuation cannot run; only a verified filter-only change commits.
-        bool restartAtEnd = record.Status == JournalStatus.RebootRequired && record.BootId == host.CurrentBoot();
+        bool restartAtEnd = record.Status == JournalStatus.RebootRequired && record.BootId == host.CurrentBoot(), resumed = false;
         if (record.Status == JournalStatus.RebootRequired && !restartAtEnd)
         {
             int result = host.RunWorker("--resume", id);
-            if (result != 0) throw new InvalidOperationException("Post-restart driver continuation failed with exit code " + result + ".");
+            // The continuation may itself attach filters, which take effect only
+            // after another restart; that restart is requested at the end.
+            if (result == 3010) restartAtEnd = resumed = true;
+            else if (result != 0) throw new InvalidOperationException("Post-restart driver continuation failed with exit code " + result + ".");
             record = host.Load(id);
         }
         if (record.Status != JournalStatus.Applied && !restartAtEnd) throw new InvalidOperationException("Driver transaction did not reach its verified applied state.");
         using var lease = host.OpenLease(id);
         var actual = lease.Inspect();
-        if (restartAtEnd && !DriverTransaction.CanCommitBeforeRestart(record, actual))
+        if (restartAtEnd && !(resumed ? DriverTransaction.CanCommitAfterResume(record, actual, host.CurrentBoot()) : DriverTransaction.CanCommitBeforeRestart(record, actual)))
             throw new InvalidOperationException("Driver maintenance requires a restart before setup can finish.");
         if (record.Operation == Operation.Uninstall)
         {
