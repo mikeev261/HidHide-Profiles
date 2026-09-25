@@ -81,8 +81,8 @@ public static class DirectMsiActions
 
             int.TryParse(session["CLIENTPROCESSID"], out int clientProcessId);
             using var user = new MaintenanceUser(sid, clientProcessId);
-            helper = user.StartMaintenance(id, operation == "uninstall");
-            WaitForReady(id, helper);
+            helper = user.StartMaintenance(id, operation == "uninstall", out var errors);
+            WaitForReady(id, helper, errors);
             session[HelperProperty] = helper.Id.ToString(System.Globalization.CultureInfo.InvariantCulture);
             session.Log("HidHide ordinary-user maintenance is ready for protected MSI execution.");
             helper.Dispose(); helper = null;
@@ -227,21 +227,17 @@ public static class DirectMsiActions
         public void Complete() => lease.Complete();
         public void Dispose() => lease.Dispose();
     }
-    static void WaitForReady(Guid id, Process helper)
+    // A helper that exits early reports its reason (e.g. the editor is open)
+    // through its private stderr pipe; ReportFailure shows and logs it.
+    static void WaitForReady(Guid id, Process helper, HelperErrorOutput errors) => HelperReadiness.Wait(helper, errors, () =>
     {
-        var deadline = DateTime.UtcNow.AddSeconds(20);
-        while (DateTime.UtcNow < deadline)
+        try
         {
-            if (helper.HasExited) throw new InvalidOperationException("The configuration helper exited before confirming readiness (code " + helper.ExitCode + "). Open HidHide Profiles, resolve any pending recovery or ownership message, then retry setup.");
-            try
-            {
-                using var ready = EventWaitHandle.OpenExisting(EventName("Ready", id));
-                if (ready.WaitOne(250)) return;
-            }
-            catch (WaitHandleCannotBeOpenedException) { Thread.Sleep(100); }
+            using var ready = EventWaitHandle.OpenExisting(EventName("Ready", id));
+            return ready.WaitOne(250);
         }
-        throw new TimeoutException("Configuration maintenance did not become ready.");
-    }
+        catch (WaitHandleCannotBeOpenedException) { Thread.Sleep(100); return false; }
+    }, TimeSpan.FromSeconds(20));
     static void ValidateHelper(int pid, string sid, string operation)
     {
         if (!DirectMsiPolicy.NeedsResidentHelper(operation, recovery: false))

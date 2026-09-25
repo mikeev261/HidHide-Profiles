@@ -50,24 +50,41 @@ internal sealed class MaintenanceUser : IDisposable
         catch { token.Dispose(); throw; }
     }
 
-    public Process StartMaintenance(Guid id, bool uninstall)
+    public Process StartMaintenance(Guid id, bool uninstall, out HelperErrorOutput errors)
     {
         if (id == Guid.Empty) throw new ArgumentException("Missing maintenance transaction.");
         string cli = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "HidHide", "HidHideCLI.exe");
         if (!File.Exists(cli)) throw new FileNotFoundException("The installed maintenance helper is missing.", cli);
-        return Start(cli, (uninstall ? "--maintenance-msi-uninstall " : "--maintenance-msi ") + id.ToString("D"));
+        return Start(cli, (uninstall ? "--maintenance-msi-uninstall " : "--maintenance-msi ") + id.ToString("D"), out errors);
     }
+
+    internal Process Start(string executable, string arguments) => Start(executable, arguments, out _);
 
     // Internal seam also used by the isolated token probe. Production supplies
     // only the fixed installed CLI and a generated transaction GUID above.
-    internal Process Start(string executable, string arguments)
+    // The helper's stderr is a private anonymous pipe: its write end is the
+    // only handle the helper inherits, so any reported reason comes from it.
+    internal Process Start(string executable, string arguments, out HelperErrorOutput errors)
     {
-        IntPtr environment = IntPtr.Zero;
+        IntPtr environment = IntPtr.Zero, attributes = IntPtr.Zero, inherited = IntPtr.Zero;
+        bool attributesInitialized = false;
+        SafeFileHandle? errorRead = null, errorWrite = null;
         SafeAccessTokenHandle? previous = null;
         ProcessInfo child = default;
         bool resumed = false;
         try
         {
+            if (!CreatePipe(out errorRead, out errorWrite, IntPtr.Zero, 0) || !SetHandleInformation(errorWrite, 1, 1))
+                throw Error("Create maintenance diagnostics pipe");
+            IntPtr size = IntPtr.Zero;
+            InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref size);
+            attributes = Marshal.AllocHGlobal(size);
+            if (!InitializeProcThreadAttributeList(attributes, 1, 0, ref size)) throw Error("Prepare maintenance handle list");
+            attributesInitialized = true;
+            inherited = Marshal.AllocHGlobal(IntPtr.Size);
+            Marshal.WriteIntPtr(inherited, errorWrite.DangerousGetHandle());
+            if (!UpdateProcThreadAttribute(attributes, 0, (IntPtr)0x20002, inherited, (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero))
+                throw Error("Restrict maintenance handle inheritance"); // PROC_THREAD_ATTRIBUTE_HANDLE_LIST
             if (!CreateEnvironmentBlock(out environment, token, false)) throw Error("Create setup user environment");
             bool impersonating = OpenThreadToken(GetCurrentThread(), 0xC, true, out var saved);
             if (!impersonating && Marshal.GetLastWin32Error() != 1008) { saved.Dispose(); throw Error("Inspect setup impersonation"); }
@@ -75,11 +92,16 @@ internal sealed class MaintenanceUser : IDisposable
             if (!RevertToSelf()) throw Error("Enter MSI server process context");
             try
             {
-                var startup = new StartupInfo { Size = Marshal.SizeOf(typeof(StartupInfo)), Desktop = @"winsta0\default" };
+                // STARTF_USESTDHANDLES: only stderr is connected, to the diagnostics pipe.
+                var startup = new StartupInfo { Size = Marshal.SizeOf(typeof(StartupInfo)), Desktop = @"winsta0\default",
+                    Flags = 0x100, Error = errorWrite.DangerousGetHandle() };
+                var extended = new StartupInfoEx { StartupInfo = startup, AttributeList = attributes };
+                extended.StartupInfo.Size = Marshal.SizeOf(typeof(StartupInfoEx));
                 const uint flags = 0x08000404; // NO_WINDOW | UNICODE_ENVIRONMENT | SUSPENDED
+                const uint extendedFlags = flags | 0x00080000; // EXTENDED_STARTUPINFO_PRESENT
                 var command = new StringBuilder("\"" + executable + "\" " + arguments);
-                if (!CreateProcessAsUserW(token, executable, command, IntPtr.Zero, IntPtr.Zero, false, flags,
-                    environment, Path.GetDirectoryName(executable), ref startup, out child))
+                if (!CreateProcessAsUserW(token, executable, command, IntPtr.Zero, IntPtr.Zero, true, extendedFlags,
+                    environment, Path.GetDirectoryName(executable), ref extended, out child))
                 {
                     int error = Marshal.GetLastWin32Error();
                     using var processIdentity = WindowsIdentity.GetCurrent();
@@ -89,11 +111,13 @@ internal sealed class MaintenanceUser : IDisposable
                     if (error != 1314 || Process.GetCurrentProcess().SessionId != SessionId)
                         throw new Win32Exception(error, "Start ordinary-user configuration maintenance");
                     command = new StringBuilder("\"" + executable + "\" " + arguments);
+                    // The secondary logon service duplicates only the standard
+                    // handles named in STARTUPINFO; it never inherits others.
                     bool started = TokenNumber(processIdentity.AccessToken, 20) != 0
                         ? CreateProcessWithTokenW(token, 0, executable, command, flags, environment,
                             Path.GetDirectoryName(executable), ref startup, out child)
                         : processIdentity.User?.Value == Sid && CreateProcessW(executable, command, IntPtr.Zero,
-                            IntPtr.Zero, false, flags, environment, Path.GetDirectoryName(executable), ref startup, out child);
+                            IntPtr.Zero, true, extendedFlags, environment, Path.GetDirectoryName(executable), ref extended, out child);
                     if (!started) throw Error("Start ordinary-user configuration maintenance");
                 }
                 if (!OpenProcessToken(child.Process, 8, out var childToken)) throw Error("Verify maintenance process token");
@@ -102,6 +126,8 @@ internal sealed class MaintenanceUser : IDisposable
                 _ = result.Handle; // Retain exit status even if the helper exits immediately.
                 if (ResumeThread(child.Thread) == uint.MaxValue) { result.Dispose(); throw Error("Start maintenance thread"); }
                 resumed = true;
+                errors = new HelperErrorOutput(errorRead);
+                errorRead = null;
                 return result;
             }
             finally
@@ -117,6 +143,12 @@ internal sealed class MaintenanceUser : IDisposable
             if (child.Thread != IntPtr.Zero) CloseHandle(child.Thread);
             previous?.Dispose();
             if (environment != IntPtr.Zero) DestroyEnvironmentBlock(environment);
+            // The helper holds the only remaining write end, so its exit ends the stream.
+            errorWrite?.Dispose();
+            errorRead?.Dispose();
+            if (attributesInitialized) DeleteProcThreadAttributeList(attributes);
+            if (attributes != IntPtr.Zero) Marshal.FreeHGlobal(attributes);
+            if (inherited != IntPtr.Zero) Marshal.FreeHGlobal(inherited);
         }
     }
 
@@ -141,6 +173,7 @@ internal sealed class MaintenanceUser : IDisposable
         public uint X, Y, Width, Height, XChars, YChars, Fill, Flags;
         public ushort Show, ReservedBytes; public IntPtr ReservedData, Input, Output, Error;
     }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct StartupInfoEx { public StartupInfo StartupInfo; public IntPtr AttributeList; }
     [StructLayout(LayoutKind.Sequential)] struct ProcessInfo { public IntPtr Process, Thread; public uint ProcessId, ThreadId; }
     [DllImport("advapi32.dll", SetLastError = true)] static extern bool GetTokenInformation(SafeAccessTokenHandle token, int kind, out int value, int size, out int needed);
     [DllImport("kernel32.dll", SetLastError = true)] static extern SafeProcessHandle OpenProcess(uint access, bool inherit, int pid);
@@ -152,10 +185,93 @@ internal sealed class MaintenanceUser : IDisposable
     [DllImport("kernel32.dll")] static extern IntPtr GetCurrentThread();
     [DllImport("userenv.dll", SetLastError = true)] static extern bool CreateEnvironmentBlock(out IntPtr environment, SafeAccessTokenHandle token, bool inherit);
     [DllImport("userenv.dll")] static extern bool DestroyEnvironmentBlock(IntPtr environment);
-    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool CreateProcessAsUserW(SafeAccessTokenHandle token, string app, StringBuilder command, IntPtr processAttributes, IntPtr threadAttributes, bool inherit, uint flags, IntPtr environment, string? directory, ref StartupInfo startup, out ProcessInfo process);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool CreateProcessAsUserW(SafeAccessTokenHandle token, string app, StringBuilder command, IntPtr processAttributes, IntPtr threadAttributes, bool inherit, uint flags, IntPtr environment, string? directory, ref StartupInfoEx startup, out ProcessInfo process);
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool CreateProcessWithTokenW(SafeAccessTokenHandle token, uint logon, string app, StringBuilder command, uint flags, IntPtr environment, string? directory, ref StartupInfo startup, out ProcessInfo process);
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool CreateProcessW(string app, StringBuilder command, IntPtr processAttributes, IntPtr threadAttributes, bool inherit, uint flags, IntPtr environment, string? directory, ref StartupInfo startup, out ProcessInfo process);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool CreateProcessW(string app, StringBuilder command, IntPtr processAttributes, IntPtr threadAttributes, bool inherit, uint flags, IntPtr environment, string? directory, ref StartupInfoEx startup, out ProcessInfo process);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool CreatePipe(out SafeFileHandle read, out SafeFileHandle write, IntPtr attributes, uint size);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetHandleInformation(SafeFileHandle handle, uint mask, uint flags);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool InitializeProcThreadAttributeList(IntPtr list, int count, int flags, ref IntPtr size);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool UpdateProcThreadAttribute(IntPtr list, uint flags, IntPtr attribute, IntPtr value, IntPtr size, IntPtr previous, IntPtr returnSize);
+    [DllImport("kernel32.dll")] static extern void DeleteProcThreadAttributeList(IntPtr list);
     [DllImport("kernel32.dll", SetLastError = true)] static extern uint ResumeThread(IntPtr thread);
     [DllImport("kernel32.dll")] static extern bool TerminateProcess(IntPtr process, uint code);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+}
+
+// Bounded capture of the helper's stderr. The CLI writes why the resident
+// coordinator refused maintenance there; the text is display-only data from
+// the ordinary-user helper and never selects any elevated behaviour.
+internal sealed class HelperErrorOutput
+{
+    const int Limit = 4096, ReasonLimit = 512;
+    readonly byte[] buffer = new byte[Limit];
+    readonly Thread reader;
+    int length;
+
+    internal HelperErrorOutput(SafeFileHandle pipe)
+    {
+        reader = new Thread(() =>
+        {
+            try
+            {
+                using var stream = new FileStream(pipe, FileAccess.Read, 1);
+                var chunk = new byte[512];
+                int read;
+                // Keep draining past the limit so a verbose helper never blocks on a full pipe.
+                while ((read = stream.Read(chunk, 0, chunk.Length)) > 0)
+                    lock (buffer) { int copy = Math.Min(read, Limit - length); Array.Copy(chunk, 0, buffer, length, copy); length += copy; }
+            }
+            catch (IOException) { }
+            catch (ObjectDisposedException) { }
+        }) { IsBackground = true, Name = "HidHide maintenance helper stderr" };
+        reader.Start();
+    }
+
+    // Waits briefly for the (exited) helper's stream to end, then returns
+    // whatever arrived as a single plain line.
+    public string Reason(int milliseconds)
+    {
+        reader.Join(milliseconds);
+        lock (buffer) return Sanitize(Encoding.UTF8.GetString(buffer, 0, length));
+    }
+
+    // One line of printable text; brackets and braces are neutralized so the
+    // text cannot act as Windows Installer formatting in the error record.
+    internal static string Sanitize(string text)
+    {
+        var result = new StringBuilder();
+        bool separator = false;
+        foreach (char c in text)
+        {
+            var category = char.GetUnicodeCategory(c);
+            if (char.IsWhiteSpace(c) || char.IsControl(c) || category == System.Globalization.UnicodeCategory.Format || char.IsSurrogate(c))
+            {
+                separator = result.Length > 0;
+                continue;
+            }
+            if (result.Length >= ReasonLimit) break;
+            if (separator) { result.Append(' '); separator = false; }
+            result.Append(c == '[' || c == '{' ? '(' : c == ']' || c == '}' ? ')' : c);
+        }
+        return result.ToString();
+    }
+}
+
+internal static class HelperReadiness
+{
+    public static void Wait(Process helper, HelperErrorOutput errors, Func<bool> ready, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            if (helper.HasExited)
+            {
+                string reason = errors.Reason(1000).TrimEnd('.', ' ');
+                throw new InvalidOperationException("The configuration helper exited before confirming readiness (code " + helper.ExitCode + ")"
+                    + (reason.Length > 0 ? ": " + reason : "") + ". Close the HidHide Profiles editor and any application launched from it, then retry setup.");
+            }
+            if (ready()) return;
+        }
+        throw new TimeoutException("Configuration maintenance did not become ready.");
+    }
 }

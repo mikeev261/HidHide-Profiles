@@ -190,7 +190,7 @@ BOOL CHidHideClientDlg::OnInitDialog()
         if (m_Exiting || !IsWindowEnabled()) throw std::runtime_error("Close open HidHide dialogs before running setup");
         if (m_EditorService && m_EditorService->EditorOpen()) throw std::runtime_error("Close the HidHide Profiles editor before running setup. Apply or discard its unsaved changes first");
         if (m_ProfilesCoordinator && m_ProfilesCoordinator->HasLaunchedProcess())
-            throw std::runtime_error("Close the directly launched application before running setup maintenance");
+            throw std::runtime_error("Close the application launched from HidHide Profiles before running setup");
         auto confirmed = m_ProfilesEnforcement->PrepareMaintenance(); m_MaintenancePrepared = true; EnableWindow(FALSE); return confirmed;
     });
     m_ConfigurationServer = std::make_unique<HidHide::Channel::Server>();
