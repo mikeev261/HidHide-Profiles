@@ -46,7 +46,7 @@ private:
 
     HidHide::FilterDriverProxy* m_Proxy{};
     ProfilesDriverTransport m_Transport;
-    HidHide::DriverConfiguration m_Baseline, m_Expected, m_RecoveryAfter;
+    HidHide::DriverConfiguration m_Baseline, m_Expected, m_RecoveryBefore, m_RecoveryAfter; // Before/after: HidHide's last recorded attempt
     bool m_RecoveryPending{}, m_RecoveryBlocked{}, m_Conflict{};
     // Baseline recorded together with m_RecoveryAfter (what HidHide Profiles
     // applied). Set only while that pair is trustworthy evidence.
