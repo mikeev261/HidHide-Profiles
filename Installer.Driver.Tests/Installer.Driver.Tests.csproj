@@ -4,5 +4,6 @@
   <ItemGroup>
     <Compile Include="../Installer/DirectMsiFlow.cs" Link="DirectMsiFlow.cs" />
     <Compile Include="../Installer/DirectMsiPolicy.cs" Link="DirectMsiPolicy.cs" />
+    <Compile Include="../Installer/MaintenanceUser.cs" Link="MaintenanceUser.cs" />
   </ItemGroup>
 </Project>

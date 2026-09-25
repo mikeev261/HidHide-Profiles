@@ -2,6 +2,8 @@ using HidHide.DriverSetup;
 using HidHide.Installer;
 using Microsoft.Win32;
 
+if (args.Length > 0 && args[0] == CustomActionHostChecks.LiveHelper) { CustomActionHostChecks.RunLiveHelper(); return; }
+
 int checks = 0;
 void Check(bool value, string name) { if (!value) throw new Exception(name); checks++; }
 void Reject(Action action, string name) { bool threw = false; try { action(); } catch { threw = true; } Check(threw, name); }
@@ -272,6 +274,8 @@ try { Console.WriteLine($"{PayloadCacheChecks.Run()} payload cache checks passed
 catch (Exception error) { Console.WriteLine("PAYLOAD CACHE CHECK FAILED: " + error.Message); throw; }
 try { Console.WriteLine($"{ProtectedDirectoryChecks.Run()} protected directory checks passed."); }
 catch (Exception error) { Console.WriteLine("PROTECTED DIRECTORY CHECK FAILED: " + error.Message); throw; }
+try { Console.WriteLine($"{CustomActionHostChecks.Run()} custom action host checks passed."); }
+catch (Exception error) { Console.WriteLine("CUSTOM ACTION HOST CHECK FAILED: " + error.Message); throw; }
 
 sealed class MemoryJournal : ITransactionJournal {
  public int Writes; public int FailWrite;
