@@ -156,10 +156,23 @@ namespace
             auto adopted = saveFailure.AdoptCurrentAsBaseline(); if (!adopted.success || !stored.empty() || clears != 1 || saveFailureCommits) throw std::runtime_error("save-failure explicit adoption did not clear safely");
         }
         {
-            HidHide::Configuration opaqueState; opaqueState.whitelist.emplace(L"\\Device\\DefinitelyMissingVolume\\opaque.exe");
-            CProfilesEnforcementAdapter opaque(IsolatedProfileTestTransport(ProfilesDriverTransport{ [&] { return opaqueState; }, [](auto const&, auto const&) {}, false }));
-            auto observation = opaque.Observe(); if (observation.success || observation.observedKnown) throw std::runtime_error("opaque Allowed-app observation was called verified");
-            auto reconcile = opaque.Reconcile({}); if (reconcile.success || reconcile.observedKnown) throw std::runtime_error("opaque Allowed-app reconciliation was called verified");
+            // An Allowed-app entry on a volume that is not mounted (for example a
+            // feeder on a removed USB drive) has no path to show, but it is kept
+            // exactly and must not disable observation, reconciliation or exit.
+            std::wstring const opaqueImage{ L"\\Device\\DefinitelyMissingVolume\\opaque.exe" };
+            HidHide::Configuration opaqueState; opaqueState.whitelist.emplace(opaqueImage);
+            CProfilesEnforcementAdapter opaque(IsolatedProfileTestTransport(ProfilesDriverTransport{ [&] { return opaqueState; },
+                [&](auto const&, auto const& requested) { HidHide::SetDriverState(opaqueState, requested); }, false }));
+            auto observation = opaque.Observe();
+            if (!observation.success || !observation.observedKnown || !observation.observed.allowedApplications.empty()) throw std::runtime_error("opaque Allowed-app entry disabled observation");
+            auto reconcile = opaque.Reconcile(desired);
+            if (!reconcile.success || !(reconcile.observed == desired) || !opaqueState.whitelist.count(opaqueImage)) throw std::runtime_error("opaque Allowed-app entry was not preserved by reconciliation");
+            auto opaqueRestored = opaque.RestoreBaseline();
+            if (!opaqueRestored.success || opaqueState.active || !opaqueState.blacklist.empty() || opaqueState.whitelist.size() != 1 || !opaqueState.whitelist.count(opaqueImage))
+                throw std::runtime_error("opaque Allowed-app entry was not preserved by baseline restoration");
+            opaqueState.whitelist.emplace(L"\\Device\\AnotherMissingVolume\\external.exe");
+            auto changed = opaque.Observe(); if (changed.success || !changed.conflict) throw std::runtime_error("external opaque Allowed-app change was not detected");
+            auto opaqueAdopted = opaque.AdoptCurrentAsBaseline(); if (!opaqueAdopted.success || !opaque.Observe().success) throw std::runtime_error("opaque Allowed-app entries could not be adopted");
         }
         {
             HidHide::Configuration legacyState; bool legacyPending{ true }; unsigned writes{}, clears{};
@@ -183,14 +196,19 @@ namespace
             HidHide::Configuration opaqueBlockedState; opaqueBlockedState.whitelist.emplace(L"\\Device\\DefinitelyMissingVolume\\opaque.exe");
             bool legacyPending{ true }; unsigned clears{}, writes{}; auto evidence = std::vector<std::uint8_t>{ 4, 5, 6 };
             CProfilesEnforcementAdapter opaqueBlocked(IsolatedProfileTestTransport(ProfilesDriverTransport{
-                [&] { return opaqueBlockedState; }, [&](auto const&, auto const&) { ++writes; }, true,
+                [&] { return opaqueBlockedState; }, [&](auto const&, auto const& requested) { ++writes; HidHide::SetDriverState(opaqueBlockedState, requested); }, true,
                 []() -> std::optional<std::vector<std::uint8_t>> { return std::nullopt; }, [](auto const&) {}, [] {},
                 [&] { return legacyPending; }, [&] { ++clears; evidence.clear(); legacyPending = false; } }));
+            if (opaqueBlocked.Observe().success || opaqueBlocked.Reconcile(desired).success || clears || writes)
+                throw std::runtime_error("legacy recovery evidence did not block a runtime with an opaque Allowed-app entry");
+            // The full driver tuple, including the opaque entry, is represented
+            // by the adopted baseline, so explicit adoption may clear evidence.
             auto adopted = opaqueBlocked.AdoptCurrentAsBaseline();
-            if (adopted.success || !adopted.conflict || clears || writes || evidence != std::vector<std::uint8_t>({ 4, 5, 6 }))
-                throw std::runtime_error("opaque blocked adoption destroyed recovery evidence");
-            if (opaqueBlocked.Observe().success || opaqueBlocked.Reconcile(desired).success || opaqueBlocked.RestoreBaseline().success || clears || writes)
-                throw std::runtime_error("failed opaque adoption unblocked enforcement");
+            if (!adopted.success || adopted.conflict || clears != 1 || writes || !evidence.empty())
+                throw std::runtime_error("explicit adoption with an opaque Allowed-app entry did not clear evidence exactly once");
+            if (!opaqueBlocked.Observe().success || !opaqueBlocked.Reconcile(desired).success
+                || !opaqueBlockedState.whitelist.count(L"\\Device\\DefinitelyMissingVolume\\opaque.exe"))
+                throw std::runtime_error("adopted opaque Allowed-app entry was not preserved");
         }
         return true;
     }
