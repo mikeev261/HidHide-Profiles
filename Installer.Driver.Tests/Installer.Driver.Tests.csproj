@@ -1,4 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net48</TargetFramework><LangVersion>latest</LangVersion><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><PlatformTarget>x64</PlatformTarget></PropertyGroup>
   <ItemGroup><ProjectReference Include="../Installer.Driver/HidHide.DriverSetup.csproj" /></ItemGroup>
+  <ItemGroup>
+    <Compile Include="../Installer/DirectMsiFlow.cs" Link="DirectMsiFlow.cs" />
+    <Compile Include="../Installer/DirectMsiPolicy.cs" Link="DirectMsiPolicy.cs" />
+  </ItemGroup>
 </Project>

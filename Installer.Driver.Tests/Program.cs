@@ -81,7 +81,14 @@ foreach (var failure in new[] { "stage", "create", "bind", "filter0", "filter1",
  Check(saved.Status == JournalStatus.RecoveryRequired, "Failure retains recovery state");
  Check(!saved.Steps.Last().Completed, "Unknown outcome recorded as intent only");
  Reject(() => engine.Apply(), "Unknown step never replayed");
- Reject(() => engine.Rollback(), "Unknown ownership never guessed");
+ if (failure == "stage")
+ {
+  // Nothing was staged: resources observed exactly as before prove the
+  // unknown step changed nothing, so rollback closes without native calls.
+  int calls = backend.Calls.Count;
+  Check(engine.Rollback() == JournalStatus.RolledBack && backend.Calls.Count == calls, "Unchanged unknown outcome closes without native calls");
+ }
+ else Reject(() => engine.Rollback(), "Unknown ownership never guessed");
 }
 var detachFailure = Fake.Healthy(); detachFailure.Fail = "filter1";
 var detachRecord = Record(detachFailure, Operation.Uninstall);
@@ -141,7 +148,12 @@ SettingsRestoration.Apply(restoreExpected, restoreDesired, () => CopySettings(re
 Check(writes.SequenceEqual(new[] { SettingsField.Active, SettingsField.Whitelist, SettingsField.Blacklist, SettingsField.Inverse, SettingsField.Active }), "Baseline restoration disables first and enables last");
 Check(restoreState.Same(restoreDesired), "Baseline restoration read-back confirms all fields");
 writes.Clear();
-Reject(() => SettingsRestoration.Apply(restoreExpected, restoreDesired, () => CopySettings(restoreState), WriteSetting), "Stale restoration rejected");
+// A retry after a restoration that already succeeded (e.g. the commit that
+// followed it failed) completes without writing again.
+SettingsRestoration.Apply(restoreExpected, restoreDesired, () => CopySettings(restoreState), WriteSetting);
+Check(writes.Count == 0 && restoreState.Same(restoreDesired), "Repeated restoration is idempotent");
+var external = CopySettings(restoreDesired); external.Inverse = !external.Inverse;
+Reject(() => SettingsRestoration.Apply(restoreExpected, restoreDesired, () => CopySettings(external), WriteSetting), "Stale restoration rejected");
 Check(writes.Count == 0, "Stale baseline never overwrites external state");
 SettingsRestoration.Apply(restoreDesired, restoreDesired, () => CopySettings(restoreState), WriteSetting);
 Check(writes.Count == 0, "Confirmed baseline restoration is idempotent");
@@ -251,6 +263,10 @@ Reject(() => crashRecovery.Rollback(), "reloaded inverse intent cannot restart")
 Reject(() => crashRecovery.ResumeAfterReboot("3"), "reloaded inverse intent cannot resume");
 Check(crashUndo.Calls.Count == crashCalls, "completion-write crash does not replay native inverse");
 Console.WriteLine($"{checks} driver transaction checks passed.");
+try { Console.WriteLine($"{DirectMsiFlowChecks.Run()} direct MSI flow checks passed."); }
+catch (Exception error) { Console.WriteLine("DIRECT MSI FLOW CHECK FAILED: " + error.Message); throw; }
+try { Console.WriteLine($"{PayloadCacheChecks.Run()} payload cache checks passed."); }
+catch (Exception error) { Console.WriteLine("PAYLOAD CACHE CHECK FAILED: " + error.Message); throw; }
 
 sealed class MemoryJournal : ITransactionJournal {
  public int Writes; public int FailWrite;

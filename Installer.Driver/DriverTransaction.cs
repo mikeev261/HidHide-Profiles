@@ -167,6 +167,26 @@ public sealed partial class DriverTransaction
             throw;
         }
     }
+    // A retained healthy driver whose only changes are verified class-filter
+    // additions may commit before the restart that activates them. Upgrades
+    // never force a mid-setup restart; Windows Installer restarts at the end.
+    public static bool CanCommitBeforeRestart(TransactionRecord record, DriverState observed)
+    {
+        if (record.Status != JournalStatus.RebootRequired || !record.Reboot || record.RollbackDirection ||
+            record.Operation is not (Operation.Upgrade or Operation.Repair) || !record.Before.CoreHealthy || record.Before.Settings == null ||
+            record.Steps.Count == 0 || record.Steps.Any(x => x.Kind != StepKind.Filter || !x.Completed || x.UndoStarted || x.Undone) ||
+            !observed.Healthy || observed.Settings == null || !observed.Settings.Same(record.Before.Settings) ||
+            !observed.Nodes.Select(x => x.Id).SequenceEqual(record.Before.Nodes.Select(x => x.Id), StringComparer.OrdinalIgnoreCase) ||
+            !observed.Packages.SequenceEqual(record.Before.Packages, StringComparer.OrdinalIgnoreCase))
+            return false;
+        for (int index = 0; index < 3; index++)
+        {
+            var edits = record.Steps.Where(x => x.FilterIndex == index).ToArray();
+            if (edits.Length > 1 || !observed.Filters[index].Same(edits.SingleOrDefault()?.AfterFilter ?? record.Before.Filters[index])) return false;
+        }
+        return true;
+    }
+
     public JournalStatus ResumeAfterReboot(string currentBootId)
     {
         ProtectedJournal.Validate(record);
