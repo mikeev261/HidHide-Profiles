@@ -159,4 +159,23 @@ namespace HidHide
         auto const fullImageNameWithoutDosDeviceName{ std::filesystem::path(fullImageName.native().substr(dosDeviceName.native().size() + 1)) };
         return (volumeMountPoint / fullImageNameWithoutDosDeviceName);
     }
+
+    _Use_decl_annotations_
+    FullImageNames MissingWhitelistEntries(FullImageNames const& whitelist)
+    {
+        TRACE_ALWAYS(L"");
+        FullImageNames result;
+        for (auto const& fullImageName : whitelist)
+        {
+            // Only an entry on a present volume whose file is absent is provably gone. An entry on a
+            // volume that is not mounted (e.g. an unplugged USB drive) or one that can't be checked is kept
+            std::filesystem::path fileName;
+            try { fileName = FullImageNameToFileName(fullImageName); } catch (...) { continue; }
+            if (fileName.empty()) continue;
+            std::error_code ec;
+            auto const status{ std::filesystem::status(fileName, ec) };
+            if (status.type() == std::filesystem::file_type::not_found) result.insert(fullImageName);
+        }
+        return (result);
+    }
 }
