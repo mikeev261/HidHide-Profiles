@@ -1323,3 +1323,25 @@ TEST(ProcessLifetimeCache, RecycledPidDuringIncompleteInactiveGapExpiresPinAfter
     EXPECT_EQ((std::vector<std::wstring>{f.c,f.a,f.b}),f.history.Running());
     cache.ConsumeExited(); EXPECT_EQ(f.a,f.Scan({b,successor}));
 }
+
+TEST(ProfileClientSource, ResourceEditorNextValuesDoNotCollide)
+{
+    // #34: the resource editor assigns _APS_NEXT_* to the next new object.
+    auto root=std::filesystem::path(__FILE__).parent_path().parent_path();
+    std::istringstream in(ReadBytes(root/L"HidHideClient/resource.h")); std::string line;
+    std::map<std::string,unsigned long> maxima, next;
+    while (std::getline(in,line))
+    {
+        std::istringstream fields(line); std::string define, name, value;
+        if (!(fields >> define >> name >> value) || define != "#define" || value.empty() || !std::isdigit(static_cast<unsigned char>(value[0]))) continue;
+        auto number = std::stoul(value, nullptr, 0);
+        if (name.rfind("_APS_NEXT_", 0) == 0) { next[name] = number; continue; }
+        auto prefix = name.substr(0, name.find('_'));
+        auto kind = prefix == "IDC" ? "control" : prefix == "IDS" ? "string" : prefix.rfind("ID",0) == 0 && name.rfind("ID_",0) == 0 ? "command" : "resource";
+        maxima[kind] = (std::max)(maxima[kind], number);
+    }
+    ASSERT_TRUE(next.count("_APS_NEXT_CONTROL_VALUE") && next.count("_APS_NEXT_RESOURCE_VALUE") && next.count("_APS_NEXT_COMMAND_VALUE"));
+    EXPECT_GT(next["_APS_NEXT_CONTROL_VALUE"], maxima["control"]);
+    EXPECT_GT(next["_APS_NEXT_RESOURCE_VALUE"], maxima["resource"]);
+    EXPECT_GT(next["_APS_NEXT_COMMAND_VALUE"], maxima["command"]);
+}
