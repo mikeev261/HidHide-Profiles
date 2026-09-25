@@ -20,6 +20,11 @@ async function session(name,body){
  let closed=false;app.on('close',()=>{closed=true;});
  try{
   const page=await app.firstWindow();
+  // Optional: keep the test window in the right half of the screen (HIDHIDE_TEST_WINDOW=right).
+  if(process.env.HIDHIDE_TEST_WINDOW==='right')await app.evaluate(({BrowserWindow,screen})=>{
+   const area=screen.getPrimaryDisplay().workArea,half=Math.floor(area.width/2);
+   BrowserWindow.getAllWindows()[0].setBounds({x:area.x+half,y:area.y,width:area.width-half,height:area.height});
+  });
   const control=options=>app.evaluate((_electron,value)=>globalThis.__fixtureControl(value),options);
   await control({reset:true});
   await expect(page.getByRole('heading',{name:'Le Mans Ultimate',exact:true})).toBeVisible();
