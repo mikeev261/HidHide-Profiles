@@ -41,6 +41,14 @@ namespace HidHide::Profiles
             return result;
         }
 
+        // Serialized catalog files must stay readable: reject output over the
+        // read limit before anything is written.
+        inline std::string Bounded(std::string bytes)
+        {
+            if (bytes.size() > MaxBytes) throw std::invalid_argument("Profile data exceeds the 4 MiB file size limit");
+            return bytes;
+        }
+
         inline std::string ToUtf8(std::wstring const& text)
         {
             if (text.empty()) return {};
@@ -140,8 +148,11 @@ namespace HidHide::Profiles
             {
                 auto start = m_Offset; bool negative = m_Text[m_Offset] == L'-'; if (negative) ++m_Offset;
                 if (m_Offset >= m_Text.size() || m_Text[m_Offset] < L'0' || m_Text[m_Offset] > L'9') Fail("Invalid number");
-                if (m_Text[m_Offset] == L'0' && m_Offset + 1 < m_Text.size() && std::iswdigit(m_Text[m_Offset + 1])) Fail("Leading zero in number");
-                while (m_Offset < m_Text.size() && std::iswdigit(m_Text[m_Offset])) ++m_Offset;
+                // JSON digits are ASCII only; iswdigit also accepts fullwidth and other Unicode digits.
+                auto asciiDigit = [&](std::size_t offset) { return offset < m_Text.size() && m_Text[offset] >= L'0' && m_Text[offset] <= L'9'; };
+                if (m_Text[m_Offset] == L'0' && asciiDigit(m_Offset + 1)) Fail("Leading zero in number");
+                while (asciiDigit(m_Offset)) ++m_Offset;
+                if (m_Offset < m_Text.size() && std::iswdigit(m_Text[m_Offset])) Fail("Invalid number");
                 if (m_Offset < m_Text.size() && (m_Text[m_Offset] == L'.' || m_Text[m_Offset] == L'e' || m_Text[m_Offset] == L'E')) Fail("Floating point is not allowed");
                 auto digits = m_Text.substr(start + (negative ? 1 : 0), m_Offset - start - (negative ? 1 : 0));
                 std::uint64_t magnitude{};
@@ -241,7 +252,7 @@ namespace HidHide::Profiles
                 << L", \"visibility\": " << Json::Escape(rule.visibility == Visibility::Hidden ? L"hidden" : L"visible") << L"}";
         }
         out << (profile.rules.empty() ? L"]\n}" : L"\n  ]\n}") << L"\n";
-        return Json::ToUtf8(out.str());
+        return Json::Bounded(Json::ToUtf8(out.str()));
     }
 
     inline Profile ParseProfile(std::string const& bytes)
@@ -278,11 +289,14 @@ namespace HidHide::Profiles
             << L",\n  \"paused\": " << (settings.paused ? L"true" : L"false")
             << L",\n  \"startWithWindows\": " << (settings.startWithWindows ? L"true" : L"false")
             << L",\n  \"allowedApplications\": [";
+        // Entries differing only in case are one application; ParseSettings rejects duplicates.
+        std::set<std::wstring> applications;
+        for (auto const& application : settings.allowedApplications) applications.insert(NormalizeExecutable(application).native());
         std::size_t index{};
-        for (auto const& application : settings.allowedApplications)
-            out << (index++ ? L", " : L"") << Json::Escape(NormalizeExecutable(application).native());
+        for (auto const& application : applications)
+            out << (index++ ? L", " : L"") << Json::Escape(application);
         out << L"]\n}\n";
-        return Json::ToUtf8(out.str());
+        return Json::Bounded(Json::ToUtf8(out.str()));
     }
 
     inline Settings ParseSettings(std::string const& bytes)

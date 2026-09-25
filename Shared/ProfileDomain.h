@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <Windows.h>
 
 namespace HidHide::Profiles
 {
@@ -99,7 +100,10 @@ namespace HidHide::Profiles
         if (!path.is_absolute() || path.native().rfind(L"\\\\", 0) == 0 || _wcsicmp(path.extension().c_str(), L".exe") != 0)
             throw std::invalid_argument("Application profile executable must be an absolute local .exe path");
         auto text = path.native();
-        std::transform(text.begin(), text.end(), text.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+        // Windows paths are case-insensitive for all of Unicode, not only ASCII.
+        if (!text.empty() && ::LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, text.c_str(), static_cast<int>(text.size()),
+            text.data(), static_cast<int>(text.size()), nullptr, nullptr, 0) != static_cast<int>(text.size()))
+            throw std::runtime_error("Application path case normalization failed");
         return text;
     }
 
