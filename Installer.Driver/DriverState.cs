@@ -51,6 +51,12 @@ public sealed class DriverState
         string.Equals(Nodes[0].Service, "HidHide", StringComparison.OrdinalIgnoreCase) &&
         ServiceExists && !ServicePendingDeletion && BinaryHash == Payload.SysHash && ControlAvailable;
     public bool Healthy => CoreHealthy && Filters.All(x => x.Entries.Any(DriverFilters.IsHidHide));
+    // Exactly the owned signed driver, possibly with its device disabled
+    // (CM_PROB_DISABLED, so no control device): uninstall may remove it.
+    public bool Removable => CoreHealthy || Nodes.Length == 1 && Nodes[0].Problem == 22 && Packages.Length == 1 &&
+        string.Equals(Nodes[0].Inf, Packages[0], StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(Nodes[0].Service, "HidHide", StringComparison.OrdinalIgnoreCase) &&
+        ServiceExists && !ServicePendingDeletion && BinaryHash == Payload.SysHash;
     // Inspection independently verifies every surviving INF and service path.
     // Missing resources can be reconstructed additively; unknown bytes cannot.
     public bool Repairable => !ServicePendingDeletion && Filters.Length == 3 && Nodes.Length <= 1 && Packages.Length <= 1 &&
