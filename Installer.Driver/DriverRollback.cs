@@ -70,12 +70,26 @@ public sealed partial class DriverTransaction
             throw new InvalidOperationException("Removed driver still has unexpected ownership or baseline.");
     }
 
+    // Resources observed exactly as before prove the transaction changed
+    // nothing, even when a step's outcome was never acknowledged. Removals and
+    // restart-pending or unfinished binding work may still take effect later.
+    public static bool Unchanged(TransactionRecord record, DriverState observed) =>
+        !record.Reboot &&
+        record.Steps.All(x => x.Kind is StepKind.Stage or StepKind.CreateNode or StepKind.Bind or StepKind.Filter) &&
+        record.Steps.All(x => x.Completed || x.Kind != StepKind.Bind) &&
+        ProtectedJournal.StateBytes(observed).SequenceEqual(ProtectedJournal.StateBytes(record.Before));
+
     public JournalStatus Rollback()
     {
         ProtectedJournal.Validate(record);
         if (record.RollbackDirection || record.Status != JournalStatus.Applied && record.Status != JournalStatus.RecoveryRequired &&
             record.Status != JournalStatus.Applying && record.Status != JournalStatus.RebootRequired)
             throw new InvalidOperationException("Cannot begin rollback from this transaction state.");
+        if (Unchanged(record, backend.Inspect()))
+        {
+            record.RollbackDirection = true; record.Status = JournalStatus.RolledBack; record.Failure = "";
+            journal.Save(record); return record.Status;
+        }
         ValidateRollbackOwnership();
         if (record.Steps.Any(x => x.Undone || x.UndoStarted)) throw new InvalidOperationException("Historical rollback direction is unknown.");
         if (record.Reboot)

@@ -46,9 +46,25 @@ public sealed class DirectMsiFlow
             int resumed = host.RunWorker("--resume", id);
             if (resumed == 3010) throw new InvalidOperationException("Another restart is required before setup can continue.");
             if (resumed != 0) throw new InvalidOperationException("Protected driver recovery failed with exit code " + resumed + ".");
+            existing = host.Load(id);
         }
-        else if (existing.Status != JournalStatus.Prepared && existing.Status != JournalStatus.Applied)
-            throw new InvalidOperationException("Pending driver maintenance requires explicit recovery.");
+        if (existing.Status != JournalStatus.Prepared && existing.Status != JournalStatus.Applied) CloseTerminal(id, existing);
+    }
+
+    // A previous attempt that ended rolled back, or whose resources are
+    // observed exactly as before, is terminal. Close it without any native
+    // change and fail this attempt so the next setup starts a fresh transaction.
+    void CloseTerminal(Guid id, TransactionRecord record)
+    {
+        using var lease = host.OpenLease(id);
+        bool terminal = record.Status == JournalStatus.RolledBack ||
+            record.Status is JournalStatus.Committed or JournalStatus.RecoveryRequired or JournalStatus.Applying or JournalStatus.RollingBack &&
+            DriverTransaction.Unchanged(record, lease.Inspect());
+        if (!terminal) throw new InvalidOperationException("Pending driver maintenance requires explicit recovery.");
+        record.Status = JournalStatus.Committed; record.Reboot = false; host.Save(record);
+        lease.Complete();
+        host.Log("HidHide closed a previous driver transaction that made no remaining driver changes.");
+        throw new InvalidOperationException("A previous interrupted setup was rolled back and closed without driver changes; run setup again.");
     }
 
     // Runs the prepared transaction and records whether Windows must restart.

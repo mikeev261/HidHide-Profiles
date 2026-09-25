@@ -16,7 +16,92 @@ static class DirectMsiFlowChecks
         UninstallRemovesDriverAfterRestart();
         HealthyUpgradeCommitsWithoutRestart();
         PreparedTransactionClosesOnForwardRollback();
+        RolledBackRecoveryClosesAndNextSetupStartsFresh();
+        CommittedMarkerClosesOnlyWhenStateIsUnchanged();
+        UnchangedFailedFirstStepClosesInSameAttempt();
+        UnchangedFailedStepFoundByRecoveryRunCloses();
+        ChangedFailedTransactionStillRequiresExplicitRecovery();
         return checks;
+    }
+
+    const string RunAgain = "run setup again";
+
+    // #1: a restart-requiring rollback is resumed by a recovery rerun and
+    // reaches RolledBack; that must be terminal, not a permanent block.
+    static void RolledBackRecoveryClosesAndNextSetupStartsFresh()
+    {
+        var host = new FlowHost(new Fake()) { KillNextWorkerAfterRun = true };
+        var first = host.Msi("install");
+        Check(!first.Succeeded && host.Marker != null && host.Last.Status == JournalStatus.RollbackRebootRequired, "killed worker rollback waits for restart");
+        host.Reboot();
+        var second = host.Msi("install");
+        Check(!second.Succeeded && host.Last.Status == JournalStatus.RollbackRebootRequired, "filter undo needs a second restart");
+        host.Reboot();
+        var third = host.Msi("install");
+        Check(!third.Succeeded && third.Failure.Contains(RunAgain), "rolled-back recovery fails cleanly: " + third.Failure);
+        Check(host.Marker == null && host.Last.Status == JournalStatus.Committed && host.Backend.State.CanInstall, "rolled-back recovery closes the transaction");
+        var fourth = host.Msi("install");
+        Check(fourth.Succeeded && host.Marker == null && host.Backend.State.Healthy, "next setup starts a fresh transaction");
+    }
+
+    // #1: Committed with a leftover marker (crash before the marker was cleared).
+    static void CommittedMarkerClosesOnlyWhenStateIsUnchanged()
+    {
+        var host = new FlowHost(new Fake()) { FailBeforeWorker = true };
+        host.Msi("install");
+        var id = host.Last.Id; host.Marker = id; host.FailBeforeWorker = false; // crash before lease.Complete()
+        var closed = host.Msi("install");
+        Check(!closed.Succeeded && closed.Failure.Contains(RunAgain) && host.Marker == null, "unchanged committed transaction is closed: " + closed.Failure);
+        Check(host.Msi("install").Succeeded, "setup after closing a committed marker succeeds");
+
+        var installed = new FlowHost(new Fake());
+        installed.Msi("install");
+        installed.Marker = installed.Last.Id; int calls = installed.Backend.Calls.Count;
+        var refused = installed.Msi("install");
+        Check(!refused.Succeeded && !refused.Failure.Contains(RunAgain) && installed.Marker != null, "committed transaction with changed state is not closed");
+        Check(installed.Backend.Calls.Count == calls && installed.Backend.State.Healthy, "refusal makes no native changes");
+    }
+
+    // #3: a failed step that changed nothing is closed by the MSI rollback of
+    // the same attempt, for install and for uninstall.
+    static void UnchangedFailedFirstStepClosesInSameAttempt()
+    {
+        var install = new FlowHost(new Fake()); install.Backend.Fail = "stage";
+        var failed = install.Msi("install");
+        Check(!failed.Succeeded && install.Marker == null && install.Last.Status == JournalStatus.Committed, "unchanged failed install is closed by rollback");
+        install.Backend.Fail = "";
+        Check(install.Msi("install").Succeeded && install.Backend.State.Healthy, "install can be retried after an unchanged failure");
+
+        var uninstall = new FlowHost(Fake.Healthy()); uninstall.Backend.Fail = "filter0";
+        var refused = uninstall.Msi("uninstall");
+        Check(!refused.Succeeded && uninstall.Marker == null && uninstall.Backend.State.Healthy, "unchanged failed uninstall is closed by rollback");
+        uninstall.Backend.Fail = "";
+        Check(uninstall.Msi("uninstall").Succeeded && uninstall.Backend.State.Empty, "uninstall can be retried after an unchanged failure");
+    }
+
+    // #3: the same unchanged failure, found by a later recovery rerun (the
+    // forward rollback never ran, for example because setup was terminated).
+    static void UnchangedFailedStepFoundByRecoveryRunCloses()
+    {
+        var host = new FlowHost(new Fake()) { SkipRollback = true }; host.Backend.Fail = "stage";
+        host.Msi("install");
+        Check(host.Marker != null && host.Last.Status == JournalStatus.RecoveryRequired, "terminated setup leaves recovery evidence");
+        host.SkipRollback = false; host.Backend.Fail = "";
+        var closed = host.Msi("install");
+        Check(!closed.Succeeded && closed.Failure.Contains(RunAgain) && host.Marker == null, "recovery run closes an unchanged failed transaction: " + closed.Failure);
+        Check(host.Msi("install").Succeeded, "setup after an unchanged recovery close succeeds");
+    }
+
+    // Safety: an unknown outcome that did change resources is never guessed.
+    static void ChangedFailedTransactionStillRequiresExplicitRecovery()
+    {
+        var host = new FlowHost(new Fake()); host.Backend.Fail = "bind";
+        var failed = host.Msi("install");
+        Check(!failed.Succeeded && host.Marker != null && host.Last.Status == JournalStatus.RecoveryRequired, "changed failed install keeps recovery evidence");
+        int calls = host.Backend.Calls.Count;
+        var rerun = host.Msi("install");
+        Check(!rerun.Succeeded && !rerun.Failure.Contains(RunAgain) && host.Marker != null, "changed failed install is not closed by a rerun");
+        Check(host.Backend.Calls.Count == calls, "no native changes while explicit recovery is required");
     }
 
     static void FreshInstallCommitsAfterRestart()
@@ -65,7 +150,7 @@ sealed class FlowHost : IDirectMsiHost
     public string Boot = "1";
     public Guid? Marker;
     public string MarkerOperation = "";
-    public bool MarkerRestart, FailBeforeWorker;
+    public bool MarkerRestart, FailBeforeWorker, SkipRollback;
     // Applied to the next worker run: the process is killed after the engine
     // returns, so MSI sees a timeout while the journal holds the real outcome.
     public bool KillNextWorkerAfterRun;
@@ -97,7 +182,7 @@ sealed class FlowHost : IDirectMsiHost
         {
             Logs.Add(error.Message);
             // Rollback scripts do not survive ForceReboot; recovery runs skip it.
-            if (!rebooted && !recovery)
+            if (!rebooted && !recovery && !SkipRollback)
                 try { flow.Rollback(id); } catch (Exception rollback) { Logs.Add("rollback: " + rollback.Message); }
             return new MsiRun(false, error.Message);
         }
