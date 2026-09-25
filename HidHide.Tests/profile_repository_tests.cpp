@@ -1336,7 +1336,7 @@ TEST(CliAppClean, KeepsFeedersOnVolumesThatAreNotMounted)
     TempDirectory temp; auto removed = temp.path / L"Uninstalled.exe";
     auto presentImage = HidHide::FileNameToFullImageName(present), removedImage = HidHide::FileNameToFullImageName(removed);
     ASSERT_FALSE(presentImage.empty()); ASSERT_FALSE(removedImage.empty());
-    HidHide::FullImageName unmounted{ L"\Device\DefinitelyMissingVolume\Feeder.exe" };
+    HidHide::FullImageName unmounted{ L"\\Device\\DefinitelyMissingVolume\\Feeder.exe" };
     auto missing = HidHide::MissingWhitelistEntries({ presentImage, removedImage, unmounted });
     std::wstring kept; for (auto const& image : missing) kept += image.native() + L";";
     EXPECT_TRUE(missing == HidHide::FullImageNames({ removedImage })) << Json::ToUtf8(kept);
