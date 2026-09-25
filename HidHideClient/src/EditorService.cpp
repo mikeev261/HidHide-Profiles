@@ -216,7 +216,7 @@ namespace HidHide::Editor
             {L"runningOrder", Value{std::move(runningOrder)}}, {L"manualMaskId", Text(m_Coordinator.ManualMaskId())},
             {L"requestedId", Text(m_Coordinator.RequestedSelection().profileId)},
             {L"status", Text(m_Coordinator.Status())}, {L"conflict", Value{m_Coordinator.HasDriverConflict()}}, {L"repositoryIssues", Value{std::move(issues)}},
-            {L"devices", Value{std::move(devices)}}, {L"deviceError", Text(deviceError)}, {L"repositoryPath", Text(m_Application.Root().native())},
+            {L"devices", Value{std::move(devices)}}, {L"deviceError", Text(deviceError)}, {L"repositoryPath", Text(m_Application.Root().native())}, {L"engineInstance", Text(m_Instance)},
             {L"adoptionAwaitingSave", Value{m_Coordinator.AdoptionAwaitingSave()}},
             {L"adoptedSettings", m_Coordinator.AdoptionAwaitingSave() && m_AdoptedSettings ? Decode(SerializeSettings(*m_AdoptedSettings)) : Value{nullptr}}}};
     }
