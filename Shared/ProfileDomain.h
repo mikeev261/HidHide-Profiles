@@ -103,6 +103,14 @@ namespace HidHide::Profiles
         return text;
     }
 
+    // Observed process images are not profile input. A path no profile could
+    // name (network share, device namespace, non-.exe image) is simply no match.
+    inline std::filesystem::path NormalizeObservedExecutable(std::filesystem::path const& path) noexcept
+    {
+        try { return NormalizeExecutable(path); }
+        catch (...) { return {}; }
+    }
+
     inline void Validate(Profile const& profile)
     {
         if (!IsStableId(profile.id)) throw std::invalid_argument("Profile id is not a canonical GUID");
@@ -241,7 +249,7 @@ namespace HidHide::Profiles
                 for (auto const& process : processes)
                 {
                     if (!process.processId || !process.lifetimeIdentity || !process.pathAccessible || process.verifiedPath.empty() || process.exitedAt) continue;
-                    if (NormalizeExecutable(process.verifiedPath) != entry.path) continue;
+                    if (NormalizeObservedExecutable(process.verifiedPath) != entry.path) continue;
                     entry.instances.emplace(process.processId, process.lifetimeIdentity);
                     if (!entry.created || process.lifetimeIdentity < entry.created) entry.created = process.lifetimeIdentity;
                 }
@@ -257,7 +265,7 @@ namespace HidHide::Profiles
                     for (auto const& process : processes)
                         if (process.lifetimeIdentity && process.lifetimeIdentity < entry.created
                             && process.exitedAt >= entry.created && process.pathAccessible && !process.verifiedPath.empty()
-                            && NormalizeExecutable(process.verifiedPath) == entry.path)
+                            && NormalizeObservedExecutable(process.verifiedPath) == entry.path)
                         { entry.created = process.lifetimeIdentity; earlier = true; }
                 } while (earlier);
                 auto old = m_Entries.find(id);
@@ -266,7 +274,7 @@ namespace HidHide::Profiles
                 // verified intervals, without bridging a real inactive gap.
                 std::uint64_t continuousUntil{};
                 if (old != m_Entries.end()) for (auto const& process : processes)
-                    if (process.exitedAt && process.pathAccessible && NormalizeExecutable(process.verifiedPath) == entry.path
+                    if (process.exitedAt && process.pathAccessible && NormalizeObservedExecutable(process.verifiedPath) == entry.path
                         && (process.processId ? old->second.instances.count({process.processId, process.lifetimeIdentity}) != 0
                             : std::any_of(old->second.instances.begin(), old->second.instances.end(), [&](auto const& instance)
                                 { return instance.second >= process.lifetimeIdentity && instance.second <= process.exitedAt; })))
@@ -277,7 +285,7 @@ namespace HidHide::Profiles
                     extended = false;
                     for (auto const& process : processes)
                         if (process.lifetimeIdentity && process.lifetimeIdentity <= continuousUntil && process.exitedAt > continuousUntil
-                            && process.pathAccessible && NormalizeExecutable(process.verifiedPath) == entry.path)
+                            && process.pathAccessible && NormalizeObservedExecutable(process.verifiedPath) == entry.path)
                         { continuousUntil = process.exitedAt; extended = true; }
                 } while (extended);
                 if (old != m_Entries.end() && (std::any_of(entry.instances.begin(), entry.instances.end(),

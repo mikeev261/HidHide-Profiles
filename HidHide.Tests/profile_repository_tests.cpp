@@ -1251,6 +1251,35 @@ TEST(ProcessLifetimeCache, IrrelevantDisabledDeletedAndChangedPathsReleaseHandle
     DWORD after{}; ASSERT_TRUE(::GetProcessHandleCount(::GetCurrentProcess(), &after)); EXPECT_LE(after, before + 2);
 }
 
+TEST(ProcessLifetimeCache, UnnormalizableObservedPathsAreNoMatchAndReleaseHandles)
+{
+    // A same-name image on a network share (or any path a profile could never
+    // name) must not stop monitoring: it simply does not match.
+    ActivationFixture f; ProcessLifetimeCache cache; cache.Retain(f.snapshot);
+    std::vector<std::filesystem::path> observedPaths{ L"\\\\nas\\apps\\A.exe", L"\\\\?\\C:\\A.exe", L"\\\\?\\UNC\\nas\\apps\\A.exe",
+        L"C:\\A.scr", L"relative\\A.exe", std::wstring(L"C:\\A\0.exe", 9) };
+    DWORD before{}; ASSERT_TRUE(::GetProcessHandleCount(::GetCurrentProcess(), &before));
+    unsigned pid{ 100 };
+    for (auto const& path : observedPaths)
+    {
+        ProcessObservation observed{ ++pid, 10, path.filename().native(), path, true };
+        bool relevant{ true }; EXPECT_NO_THROW(relevant = cache.Relevant(observed)); EXPECT_FALSE(relevant);
+        HANDLE retained{};
+        ASSERT_TRUE(::DuplicateHandle(::GetCurrentProcess(), ::GetCurrentProcess(), ::GetCurrentProcess(), &retained, 0, FALSE, DUPLICATE_SAME_ACCESS));
+        EXPECT_NO_THROW(cache.Remember(retained, observed));
+        auto exited = observed; exited.exitedAt = 20; EXPECT_NO_THROW(cache.RememberExit(exited));
+        std::wstring selected; EXPECT_NO_THROW(selected = f.Scan({ observed }));
+        EXPECT_EQ(f.global, selected);
+        EXPECT_NO_THROW(selected = f.Scan({ observed, f.Process(f.a, 1, 30) }));
+        EXPECT_EQ(f.a, selected);
+        EXPECT_NO_THROW(selected = f.Scan({ exited, f.Process(f.a, 1, 30) }));
+        EXPECT_EQ(f.a, selected);
+        EXPECT_NO_THROW(selected = f.Scan({}));
+    }
+    EXPECT_EQ(0u, cache.HandleCount()); EXPECT_EQ(0u, cache.IntervalCount());
+    DWORD after{}; ASSERT_TRUE(::GetProcessHandleCount(::GetCurrentProcess(), &after)); EXPECT_LE(after, before + 2);
+}
+
 TEST(ProcessLifetimeCache, OverlappingExitsCompactAndDisjointEpisodesRemainDistinct)
 {
     ActivationFixture f; ProcessLifetimeCache cache; cache.Retain(f.snapshot);

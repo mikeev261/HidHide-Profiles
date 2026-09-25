@@ -464,7 +464,7 @@ void CProfilesCoordinator::ValidateLaunch(std::wstring const& id, DWORD ownPid)
         if (process.exitedAt || process.processId == ownPid || _wcsicmp(process.fileName.c_str(), executable.filename().c_str()) != 0) continue;
         if (!process.pathAccessible || process.verifiedPath.empty())
             throw std::runtime_error("A same-name process cannot be identified; close it before launching this profile");
-        if (_wcsicmp(HidHide::Profiles::NormalizeExecutable(process.verifiedPath).c_str(), executable.c_str()) == 0)
+        if (_wcsicmp(HidHide::Profiles::NormalizeObservedExecutable(process.verifiedPath).c_str(), executable.c_str()) == 0)
             throw std::runtime_error("This application is already running and may hold physical devices; close it before launching through HidHide Profiles");
     }
 }
