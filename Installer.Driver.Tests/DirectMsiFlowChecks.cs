@@ -21,7 +21,36 @@ static class DirectMsiFlowChecks
         UnchangedFailedFirstStepClosesInSameAttempt();
         UnchangedFailedStepFoundByRecoveryRunCloses();
         ChangedFailedTransactionStillRequiresExplicitRecovery();
+        UpgradeRestoringMissingFilterCommitsAndRestartsAtEnd();
+        RepairRestoringMissingFilterStillResumesAfterForcedRestart();
         return checks;
+    }
+
+    static Fake MissingFilter(int index)
+    {
+        var backend = Fake.Healthy(); backend.State.Filters[index].Entries = new[] { "VendorA", "VendorB" }; return backend;
+    }
+
+    // #2: upgrades never force a mid-setup restart, so a verified filter-only
+    // change on the retained driver commits and asks for a restart at the end.
+    static void UpgradeRestoringMissingFilterCommitsAndRestartsAtEnd()
+    {
+        var host = new FlowHost(MissingFilter(1));
+        var run = host.Msi("upgrade");
+        Check(run.Succeeded, "upgrade restoring a missing filter succeeds: " + run.Failure);
+        Check(host.RestartAtEnd && host.Boot == "1" && host.Marker == null && host.Last.Status == JournalStatus.Committed, "upgrade commits and requests a restart at the end");
+        Check(host.Backend.State.Healthy && host.Backend.State.Settings!.Active && host.Backend.Calls.SequenceEqual(new[] { "filter1" }), "upgrade only restores the missing filter and keeps the baseline");
+
+        var changed = new FlowHost(MissingFilter(1)) { AfterApply = backend => backend.State.Filters[0].Entries = new[] { "VendorA", "HidHide", "VendorB", "External" } };
+        var refused = changed.Msi("upgrade");
+        Check(!refused.Succeeded && !changed.RestartAtEnd && changed.Last.Status != JournalStatus.Committed, "filters changed after apply are not committed before restart");
+    }
+
+    static void RepairRestoringMissingFilterStillResumesAfterForcedRestart()
+    {
+        var host = new FlowHost(MissingFilter(2));
+        var run = host.Msi("repair");
+        Check(run.Succeeded && !host.RestartAtEnd && host.Boot == "2" && host.Workers.SequenceEqual(new[] { "--apply", "--resume" }), "repair keeps the forced-restart continuation");
     }
 
     const string RunAgain = "run setup again";
@@ -150,7 +179,8 @@ sealed class FlowHost : IDirectMsiHost
     public string Boot = "1";
     public Guid? Marker;
     public string MarkerOperation = "";
-    public bool MarkerRestart, FailBeforeWorker, SkipRollback;
+    public bool MarkerRestart, RestartAtEnd, FailBeforeWorker, SkipRollback;
+    public Action<Fake>? AfterApply;
     // Applied to the next worker run: the process is killed after the engine
     // returns, so MSI sees a timeout while the journal holds the real outcome.
     public bool KillNextWorkerAfterRun;
@@ -173,9 +203,10 @@ sealed class FlowHost : IDirectMsiHost
             else Prepare(id, operation);
             if (FailBeforeWorker) throw new InvalidOperationException("Injected failure before the driver worker ran.");
             flow.Apply(id, operation, recovery);
+            AfterApply?.Invoke(Backend);
             // ForceReboot: NOT HIDHIDE_RECOVERY AND NOT WIX_UPGRADE_DETECTED.
             if (!recovery && operation != "upgrade") { Reboot(); rebooted = true; }
-            flow.Finalize(id);
+            RestartAtEnd = flow.Finalize(id);
             return new MsiRun(true, "");
         }
         catch (Exception error)
@@ -244,6 +275,7 @@ sealed class FlowHost : IDirectMsiHost
     public bool MarkerMatches(Guid id) => Marker == id;
     public void SignalRelease(Guid id) { }
     public void Log(string message) => Logs.Add(message);
+    public string CurrentBoot() => Boot;
 
     sealed class Journal : ITransactionJournal
     {

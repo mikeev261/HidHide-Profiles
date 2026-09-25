@@ -13,6 +13,7 @@ public interface IDirectMsiHost
     // Reopens the durable marker of an existing transaction (recovery lease).
     IDirectMsiLease OpenLease(Guid id);
     bool MarkerMatches(Guid id);
+    string CurrentBoot();
     void SignalRelease(Guid id);
     void Log(string message);
 }
@@ -81,18 +82,24 @@ public sealed class DirectMsiFlow
         lease.MarkPending(operation, DirectMsiPolicy.RequiresRestart(operation, recovery, current.Reboot));
     }
 
-    public void Finalize(Guid id)
+    // Returns true when Windows must restart at the end of setup.
+    public bool Finalize(Guid id)
     {
         var record = host.Load(id);
-        if (record.Status == JournalStatus.RebootRequired)
+        // Without an intervening restart (upgrades never force one) a
+        // continuation cannot run; only a verified filter-only change commits.
+        bool restartAtEnd = record.Status == JournalStatus.RebootRequired && record.BootId == host.CurrentBoot();
+        if (record.Status == JournalStatus.RebootRequired && !restartAtEnd)
         {
             int result = host.RunWorker("--resume", id);
             if (result != 0) throw new InvalidOperationException("Post-restart driver continuation failed with exit code " + result + ".");
             record = host.Load(id);
         }
-        if (record.Status != JournalStatus.Applied) throw new InvalidOperationException("Driver transaction did not reach its verified applied state.");
+        if (record.Status != JournalStatus.Applied && !restartAtEnd) throw new InvalidOperationException("Driver transaction did not reach its verified applied state.");
         using var lease = host.OpenLease(id);
         var actual = lease.Inspect();
+        if (restartAtEnd && !DriverTransaction.CanCommitBeforeRestart(record, actual))
+            throw new InvalidOperationException("Driver maintenance requires a restart before setup can finish.");
         if (record.Operation == Operation.Uninstall)
         {
             if (!actual.Empty) throw new InvalidOperationException("Driver resources remain after uninstall.");
@@ -109,6 +116,7 @@ public sealed class DirectMsiFlow
         record = host.Load(id);
         record.Status = JournalStatus.Committed; record.Reboot = false; host.Save(record);
         lease.Complete();
+        return restartAtEnd;
     }
 
     // Forward-attempt rollback only. The caller never rolls back a transaction

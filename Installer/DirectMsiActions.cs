@@ -148,7 +148,11 @@ public static class DirectMsiActions
     {
         try
         {
-            new DirectMsiFlow(new MachineHost(session)).Finalize(Id(session));
+            if (new DirectMsiFlow(new MachineHost(session)).Finalize(Id(session)))
+            {
+                session.SetMode(InstallRunMode.RebootAtEnd, true);
+                session.Log("HidHide restored driver filters that take effect after the restart requested at the end of setup.");
+            }
             session.Log("HidHide driver transaction committed and maintenance exclusion cleared.");
             return ActionResult.Success;
         }
@@ -205,6 +209,7 @@ public static class DirectMsiActions
         public int RunWorker(string verb, Guid id) => WorkerProcess.Run(verb, id, session.Log);
         public IDirectMsiLease OpenLease(Guid id) => new MachineLease(id);
         public bool MarkerMatches(Guid id) => DirectMsiActions.MarkerMatches(id);
+        public string CurrentBoot() => BootIdentity.Current();
         public void SignalRelease(Guid id) => DirectMsiActions.SignalRelease(id);
         public void Log(string message) => session.Log(message);
     }
