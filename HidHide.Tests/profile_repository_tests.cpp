@@ -426,6 +426,9 @@ TEST(ProfileRepository, SameRevisionContentChangesRepositoryGeneration)
 
 TEST(ProfileRepository, RecoveryRejectsCorruptIntentBackupAndCommitMarker)
 {
+    // Transaction records are published atomically, so a crash can no longer
+    // tear them (see the *PartiallyWritten boundaries). The corruption below
+    // is injected after targets were replaced and must still be refused.
     TempDirectory temp; ProfileRepository repository(temp.path); auto loaded = repository.OpenOrCreate(); auto id = loaded.snapshot.settings.selectedGlobalId;
     auto version = repository.Version(id); auto draft = loaded.snapshot.profiles.at(id); draft.name = L"Changed";
     auto settings = loaded.snapshot.settings; settings.mode = Mode::UseGlobal;
@@ -472,9 +475,10 @@ TEST(ProfileRepository, CreateUpdateDeleteRecoverAsCompleteOldOrNewAtEveryBounda
     struct Injection { CommitBoundary boundary; std::size_t index; };
     std::vector<Injection> createOrUpdate{ { CommitBoundary::TempFlushed, 0 }, { CommitBoundary::TempFlushed, 1 },
         { CommitBoundary::IntentFlushed, 0 }, { CommitBoundary::TargetReplaced, 0 }, { CommitBoundary::TargetReplaced, 1 }, { CommitBoundary::SetVerified, 0 },
-        { CommitBoundary::CommitMarked, 0 }, { CommitBoundary::Completed, 0 } };
+        { CommitBoundary::CommitMarked, 0 }, { CommitBoundary::Completed, 0 }, { CommitBoundary::IntentPartiallyWritten, 0 }, { CommitBoundary::CommitMarkPartiallyWritten, 0 } };
     std::vector<Injection> deleting{ { CommitBoundary::TempFlushed, 1 }, { CommitBoundary::IntentFlushed, 0 },
-        { CommitBoundary::TargetReplaced, 0 }, { CommitBoundary::TargetReplaced, 1 }, { CommitBoundary::SetVerified, 0 }, { CommitBoundary::CommitMarked, 0 }, { CommitBoundary::Completed, 0 } };
+        { CommitBoundary::TargetReplaced, 0 }, { CommitBoundary::TargetReplaced, 1 }, { CommitBoundary::SetVerified, 0 }, { CommitBoundary::CommitMarked, 0 }, { CommitBoundary::Completed, 0 },
+        { CommitBoundary::IntentPartiallyWritten, 0 }, { CommitBoundary::CommitMarkPartiallyWritten, 0 } };
     for (auto operation : { Operation::Create, Operation::Update, Operation::Delete })
     {
         auto const& injections = operation == Operation::Delete ? deleting : createOrUpdate;
@@ -897,6 +901,50 @@ TEST(ProfileRepository, CommittedCleanupFailureReturnsTruthfulSavedOutcome)
     auto result = service.Apply(changed, service.Version(id));
     EXPECT_TRUE(result.cleanupPending); EXPECT_EQ(L"Durably saved", result.loaded.snapshot.profiles.at(id).name);
     ProfileRepository restarted(temp.path); restarted.Recover(); EXPECT_EQ(L"Durably saved", restarted.Load().snapshot.profiles.at(id).name);
+}
+
+TEST(ProfileRepository, OrdinarySaveFailureRollsBackInProcessAndKeepsRepositoryLoadable)
+{
+    // A real sharing violation (for example antivirus) on the second target,
+    // after the intent is durable and the first target was replaced.
+    TempDirectory temp; ProfileRepository repository(temp.path); auto loaded = repository.OpenOrCreate(); auto id = loaded.snapshot.settings.selectedGlobalId;
+    auto oldBytes = RepositoryBytes(temp.path);
+    auto changed = loaded.snapshot.profiles.at(id); changed.name = L"Changed"; auto settings = loaded.snapshot.settings; settings.mode = Mode::UseGlobal;
+    HANDLE locked = ::CreateFileW((temp.path / L"settings.json").c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    ASSERT_NE(INVALID_HANDLE_VALUE, locked);
+    EXPECT_THROW(repository.Apply(changed, repository.Version(id), settings, repository.SettingsVersion()), std::system_error);
+    EXPECT_FALSE(std::filesystem::exists(temp.path / L".transaction.intent"));
+    RepositoryView view(temp.path); LoadResult reloaded;
+    EXPECT_NO_THROW(reloaded = view.Load()); EXPECT_EQ(oldBytes, RepositoryBytes(temp.path));
+    EXPECT_EQ(Mode::Automatic, reloaded.snapshot.settings.mode); EXPECT_TRUE(view.Inspect().issues.empty());
+    ::CloseHandle(locked);
+    EXPECT_NO_THROW(repository.Apply(changed, repository.Version(id), settings, repository.SettingsVersion()));
+    EXPECT_EQ(L"Changed", view.Load().snapshot.profiles.at(id).name);
+}
+
+TEST(ProfileRepository, CommittedSaveWithPendingCleanupRemainsLoadable)
+{
+    // The coordinator's watcher reloads through RepositoryView while cleanup
+    // of a committed save is still blocked by a locked staging file.
+    TempDirectory temp; ProfileRepository setup(temp.path); auto loaded = setup.OpenOrCreate(); auto id = loaded.snapshot.settings.selectedGlobalId; HANDLE locked{};
+    ProfileRepository failing(temp.path, [&](CommitBoundary boundary, std::size_t)
+    {
+        if (boundary != CommitBoundary::CommitMarked) return;
+        for (auto const& entry : std::filesystem::directory_iterator(temp.path)) if (entry.path().extension() == L".bak")
+        { locked = ::CreateFileW(entry.path().c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr); break; }
+    });
+    auto changed = loaded.snapshot.profiles.at(id); changed.name = L"Committed";
+    failing.Apply(changed, failing.Version(id)); ASSERT_NE(INVALID_HANDLE_VALUE, locked); ASSERT_TRUE(failing.CleanupPending());
+    RepositoryView view(temp.path); LoadResult reloaded;
+    EXPECT_NO_THROW(reloaded = view.Load()); EXPECT_EQ(L"Committed", reloaded.snapshot.profiles.at(id).name);
+    EXPECT_TRUE(view.Inspect().issues.empty());
+    // An uncommitted intent still blocks, and a mismatched marker is not trusted.
+    auto intent = ReadBytes(temp.path / L".transaction.committed");
+    { std::ofstream out(temp.path / L".transaction.committed", std::ios::binary | std::ios::trunc); out << "00000000-0000-0000-0000-000000000000"; }
+    EXPECT_THROW(view.Load(), std::runtime_error); EXPECT_FALSE(view.Inspect().issues.empty());
+    { std::ofstream out(temp.path / L".transaction.committed", std::ios::binary | std::ios::trunc); out.write(intent.data(), static_cast<std::streamsize>(intent.size())); }
+    ::CloseHandle(locked); setup.Recover();
+    EXPECT_FALSE(std::filesystem::exists(temp.path / L".transaction.intent")); EXPECT_EQ(L"Committed", view.Load().snapshot.profiles.at(id).name);
 }
 
 TEST(ProfileRepository, RecoveryIsIdempotentAfterEveryRestoredItemAndFullVerification)
