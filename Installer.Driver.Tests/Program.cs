@@ -148,7 +148,12 @@ SettingsRestoration.Apply(restoreExpected, restoreDesired, () => CopySettings(re
 Check(writes.SequenceEqual(new[] { SettingsField.Active, SettingsField.Whitelist, SettingsField.Blacklist, SettingsField.Inverse, SettingsField.Active }), "Baseline restoration disables first and enables last");
 Check(restoreState.Same(restoreDesired), "Baseline restoration read-back confirms all fields");
 writes.Clear();
-Reject(() => SettingsRestoration.Apply(restoreExpected, restoreDesired, () => CopySettings(restoreState), WriteSetting), "Stale restoration rejected");
+// A retry after a restoration that already succeeded (e.g. the commit that
+// followed it failed) completes without writing again.
+SettingsRestoration.Apply(restoreExpected, restoreDesired, () => CopySettings(restoreState), WriteSetting);
+Check(writes.Count == 0 && restoreState.Same(restoreDesired), "Repeated restoration is idempotent");
+var external = CopySettings(restoreDesired); external.Inverse = !external.Inverse;
+Reject(() => SettingsRestoration.Apply(restoreExpected, restoreDesired, () => CopySettings(external), WriteSetting), "Stale restoration rejected");
 Check(writes.Count == 0, "Stale baseline never overwrites external state");
 SettingsRestoration.Apply(restoreDesired, restoreDesired, () => CopySettings(restoreState), WriteSetting);
 Check(writes.Count == 0, "Confirmed baseline restoration is idempotent");

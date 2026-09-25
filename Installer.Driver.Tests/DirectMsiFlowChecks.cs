@@ -23,7 +23,24 @@ static class DirectMsiFlowChecks
         ChangedFailedTransactionStillRequiresExplicitRecovery();
         UpgradeRestoringMissingFilterCommitsAndRestartsAtEnd();
         RepairRestoringMissingFilterStillResumesAfterForcedRestart();
+        FinalizeRetryAfterRestoredSettingsCommits();
         return checks;
+    }
+
+    // #12: FinalizeDriver restored the repaired driver's settings but failed
+    // before committing; the recovery rerun must finish instead of refusing
+    // the already restored settings forever.
+    static void FinalizeRetryAfterRestoredSettingsCommits()
+    {
+        var backend = Fake.Healthy(); backend.State.BinaryHash = "";
+        backend.State.Settings = new DriverSettings { Active = true, Inverse = true, Whitelist = SettingsCodec.Encode(new[] { "feeder" }), Blacklist = SettingsCodec.Encode(new[] { "device" }) };
+        var baseline = backend.State.Settings;
+        var host = new FlowHost(backend) { FailCommitOnce = true };
+        var first = host.Msi("repair");
+        Check(!first.Succeeded && host.Marker != null && host.Last.Status == JournalStatus.Applied && backend.State.Settings!.Same(baseline), "settings were restored before the commit failed");
+        var retry = host.Msi("repair");
+        Check(retry.Succeeded && host.Marker == null && host.Last.Status == JournalStatus.Committed, "finalize retry after restored settings commits: " + retry.Failure);
+        Check(backend.State.Healthy && backend.State.Settings!.Same(baseline), "retry keeps the restored baseline");
     }
 
     static Fake MissingFilter(int index)
@@ -179,7 +196,7 @@ sealed class FlowHost : IDirectMsiHost
     public string Boot = "1";
     public Guid? Marker;
     public string MarkerOperation = "";
-    public bool MarkerRestart, RestartAtEnd, FailBeforeWorker, SkipRollback;
+    public bool MarkerRestart, RestartAtEnd, FailBeforeWorker, SkipRollback, FailCommitOnce;
     public Action<Fake>? AfterApply;
     // Applied to the next worker run: the process is killed after the engine
     // returns, so MSI sees a timeout while the journal holds the real outcome.
@@ -243,6 +260,7 @@ sealed class FlowHost : IDirectMsiHost
     public void Save(TransactionRecord record)
     {
         ProtectedJournal.Validate(record);
+        if (FailCommitOnce && record.Status == JournalStatus.Committed) { FailCommitOnce = false; throw new IOException("Injected journal write failure."); }
         using var stream = new MemoryStream();
         new DataContractSerializer(typeof(TransactionRecord)).WriteObject(stream, record);
         journals[record.Id] = stream.ToArray();
@@ -290,10 +308,19 @@ sealed class FlowHost : IDirectMsiHost
         public Lease(FlowHost host) { this.host = host; }
         public void MarkPending(string operation, bool restartRequired) { host.MarkerOperation = operation; host.MarkerRestart = restartRequired; }
         public DriverState Inspect() => host.Backend.Inspect();
+        // The production restoration logic over the fake driver's settings.
         public void RestoreSettings(DriverSettings expected, DriverSettings desired)
         {
-            if (!host.Backend.State.Settings!.Same(expected)) throw new InvalidOperationException("Settings changed before baseline restoration.");
-            host.Backend.State.Settings = desired;
+            var settings = host.Backend.State.Settings!;
+            SettingsRestoration.Apply(expected, desired,
+                () => new DriverSettings { Active = settings.Active, Inverse = settings.Inverse, Whitelist = settings.Whitelist.ToArray(), Blacklist = settings.Blacklist.ToArray() },
+                (field, bytes) =>
+                {
+                    if (field == SettingsField.Active) settings.Active = bytes[0] != 0;
+                    else if (field == SettingsField.Inverse) settings.Inverse = bytes[0] != 0;
+                    else if (field == SettingsField.Whitelist) settings.Whitelist = bytes.ToArray();
+                    else settings.Blacklist = bytes.ToArray();
+                });
         }
         public void Complete() { host.Marker = null; host.MarkerRestart = false; }
         public void Dispose() { }
