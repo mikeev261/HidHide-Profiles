@@ -36,7 +36,7 @@ namespace
         HidHide::Profiles::EnforcementResult Reconcile(HidHide::Profiles::DesiredEnforcement const& desired) override
         {
             if (m_FailReconcile) return { false, false, {}, L"Injected deterministic enforcement failure" };
-            m_State = desired; ++m_Writes; return { true, true, m_State, {} };
+            m_State = desired; m_Baseline.allowedApplications = desired.allowedApplications; ++m_Writes; return { true, true, m_State, {} };
         }
         HidHide::Profiles::EnforcementResult RestoreBaseline() override { m_State = m_Baseline; return { true, true, m_State, {} }; }
         HidHide::Profiles::EnforcementResult AdoptCurrentAsBaseline() override { ++m_Adoptions; m_RecoveryEvidence.clear(); m_Baseline = m_State; return { true, true, m_State, {} }; }
@@ -154,6 +154,59 @@ namespace
             try { (void)saveFailure.PrepareMaintenance(); return false; } catch (std::runtime_error const&) {}
             if (stored.empty() || clears || saveFailureCommits) throw std::runtime_error("save-failure evidence was not preserved");
             auto adopted = saveFailure.AdoptCurrentAsBaseline(); if (!adopted.success || !stored.empty() || clears != 1 || saveFailureCommits) throw std::runtime_error("save-failure explicit adoption did not clear safely");
+        }
+        {
+            // JSON Allowed apps are normalized to lower case before they reach
+            // the adapter; they must still map to a volume image name.
+            wchar_t temporary[MAX_PATH]{}; if (!::GetTempPathW(MAX_PATH, temporary)) return false;
+            auto withFeeder = desired; withFeeder.allowedApplications.emplace(HidHide::Profiles::NormalizeExecutable(std::filesystem::path(temporary) / L"Feeder.exe"));
+            HidHide::Configuration feederState;
+            CProfilesEnforcementAdapter feederAdapter(IsolatedProfileTestTransport(ProfilesDriverTransport{
+                [&] { return feederState; }, [&](auto const&, auto const& requested) { HidHide::SetDriverState(feederState, requested); }, false }));
+            auto feederApplied = feederAdapter.Reconcile(withFeeder);
+            if (!feederApplied.success || !(feederApplied.observed == withFeeder) || feederState.whitelist.size() != 1)
+                throw std::runtime_error("a normalized Allowed app could not be applied to the driver");
+        }
+        {
+            // Allowed apps are JSON policy, not temporary enforcement. Exit and
+            // crash recovery restore hiding but keep the applied Allowed apps,
+            // so feeders stay whitelisted and the next start sees no conflict.
+            wchar_t temporary[MAX_PATH]{}; if (!::GetTempPathW(MAX_PATH, temporary)) return false;
+            auto feeder = HidHide::Profiles::NormalizeExecutable(std::filesystem::path(temporary) / L"Feeder.exe");
+            auto withFeeder = desired; withFeeder.allowedApplications.emplace(feeder);
+            auto feederOnly = HidHide::Profiles::DesiredEnforcement{}; feederOnly.allowedApplications.emplace(feeder);
+            for (bool crash : { false, true })
+            {
+                HidHide::Configuration feederState; std::optional<std::vector<std::uint8_t>> stored;
+                auto transport = IsolatedProfileTestTransport(ProfilesDriverTransport{
+                    [&] { return feederState; },
+                    [&](auto const& expected, auto const& requested)
+                    {
+                        if (HidHide::DriverState(feederState) != expected) throw std::runtime_error("test transport CAS mismatch");
+                        HidHide::SetDriverState(feederState, requested);
+                    }, true,
+                    [&] { return stored; }, [&](auto const& bytes) { stored = bytes; }, [&] { stored.reset(); } });
+                {
+                    CProfilesEnforcementAdapter running(transport);
+                    auto feederApplied = running.Reconcile(withFeeder);
+                    if (!feederApplied.success || !(feederApplied.observed == withFeeder) || !stored) throw std::runtime_error("feeder reconciliation failed");
+                    if (!crash)
+                    {
+                        auto exitRestored = running.RestoreBaseline();
+                        if (!exitRestored.success || !(exitRestored.observed == feederOnly) || stored) throw std::runtime_error("exit restoration removed a JSON-allowed feeder");
+                    }
+                }
+                CProfilesEnforcementAdapter restarted(transport);
+                auto restartObserved = restarted.Observe();
+                if (!restartObserved.success || !restartObserved.observedKnown || !(restartObserved.observed == feederOnly) || stored)
+                    throw std::runtime_error(crash ? "crash recovery removed a JSON-allowed feeder" : "restart observed a removed JSON-allowed feeder");
+                // Removing the feeder from JSON must survive restoration as well.
+                auto removed = restarted.Reconcile(desired);
+                if (!removed.success || !(removed.observed == desired)) throw std::runtime_error("feeder removal reconciliation failed");
+                auto removalRestored = restarted.RestoreBaseline();
+                if (!removalRestored.success || !(removalRestored.observed == HidHide::Profiles::DesiredEnforcement{}) || stored)
+                    throw std::runtime_error("exit restoration re-added a feeder removed from JSON");
+            }
         }
         {
             HidHide::Configuration opaqueState; opaqueState.whitelist.emplace(L"\\Device\\DefinitelyMissingVolume\\opaque.exe");

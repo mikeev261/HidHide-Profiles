@@ -178,6 +178,10 @@ HidHide::Profiles::EnforcementResult CProfilesEnforcementAdapter::Reconcile(HidH
         HidHide::Maintenance::Admission admission(m_Transport.admissionName.c_str(), m_Transport.barrierName.c_str()); auto before = HidHide::DriverState(Read());
         if (before != m_Expected) { m_Conflict = true; return Failure(L"Driver settings changed outside HidHide Profiles", true, true); }
         auto requested = ToDriver(desired);
+        // Allowed apps are authoritative JSON policy, not temporary enforcement.
+        // Every baseline restoration (exit, crash recovery, maintenance) keeps
+        // them, so feeders stay whitelisted and the next start sees no conflict.
+        m_Baseline.whitelist = requested.whitelist;
         if (before != requested) { if (requested != m_Baseline || m_RecoveryPending) SaveRecovery(before, requested); Commit(before, requested); }
         auto after = HidHide::DriverState(Read());
         if (after != requested) return Failure(L"Driver read-back did not match requested visibility", true);
