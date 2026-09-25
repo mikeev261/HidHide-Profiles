@@ -303,16 +303,7 @@ public static class DirectMsiActions
     {
         ProtectedJournal.CreateRoot();
         string target = Path.Combine(ProtectedJournal.Root, "payload");
-        if (Directory.Exists(target))
-        {
-            ProtectedJournal.ValidateDirectory(target);
-            foreach (string name in new[] { "HidHide.inf", "HidHide.sys", "hidhide.cat", "LICENSE.rtf" })
-                ProtectedJournal.ValidateAcl(File.GetAccessControl(Path.Combine(target, name)));
-            Payload.Verify(target);
-            return;
-        }
         string source = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "HidHide", "Driver");
-        ProtectedJournal.RejectReparsePath(source); Payload.Verify(source);
         if (!Directory.Exists(target))
         {
             var acl = new DirectorySecurity(); acl.SetAccessRuleProtection(true, false); acl.SetOwner(Admins);
@@ -321,17 +312,9 @@ public static class DirectMsiActions
             Directory.CreateDirectory(target, acl);
         }
         ProtectedJournal.ValidateDirectory(target);
-        foreach (string name in new[] { "HidHide.inf", "HidHide.sys", "hidhide.cat", "LICENSE.rtf" })
-        {
-            string destination = Path.Combine(target, name);
-            if (!File.Exists(destination))
-            {
-                using var input = new FileStream(Path.Combine(source, name), FileMode.Open, FileAccess.Read, FileShare.Read);
-                using var output = new FileStream(destination, FileMode.CreateNew, FileSystemRights.Write, FileShare.None, 4096, FileOptions.WriteThrough, FileAcl());
-                input.CopyTo(output); output.Flush(true);
-            }
-            ProtectedJournal.ValidateAcl(File.GetAccessControl(destination));
-        }
+        PayloadCache.Prepare(source, target, Payload.Files,
+            path => new FileStream(path, FileMode.CreateNew, FileSystemRights.Write, FileShare.None, 4096, FileOptions.WriteThrough, FileAcl()),
+            path => ProtectedJournal.ValidateAcl(File.GetAccessControl(path)));
         Payload.Verify(target);
     }
 

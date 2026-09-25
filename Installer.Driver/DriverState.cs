@@ -72,9 +72,10 @@ public static class Payload
         using var sha = SHA256.Create();
         return BitConverter.ToString(sha.ComputeHash(input)).Replace("-", "");
     }
+    public static readonly (string Name, string Hash)[] Files = { ("HidHide.inf", InfHash), ("HidHide.sys", SysHash), ("hidhide.cat", CatHash), ("LICENSE.rtf", LicenseHash) };
     public static void Verify(string directory)
     {
-        foreach (var entry in new[] { ("HidHide.inf", InfHash), ("HidHide.sys", SysHash), ("hidhide.cat", CatHash), ("LICENSE.rtf", LicenseHash) })
+        foreach (var entry in Files)
         {
             var path = Path.Combine(directory, entry.Item1);
             ProtectedJournal.RejectReparsePath(path);

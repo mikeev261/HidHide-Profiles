@@ -265,6 +265,8 @@ Check(crashUndo.Calls.Count == crashCalls, "completion-write crash does not repl
 Console.WriteLine($"{checks} driver transaction checks passed.");
 try { Console.WriteLine($"{DirectMsiFlowChecks.Run()} direct MSI flow checks passed."); }
 catch (Exception error) { Console.WriteLine("DIRECT MSI FLOW CHECK FAILED: " + error.Message); throw; }
+try { Console.WriteLine($"{PayloadCacheChecks.Run()} payload cache checks passed."); }
+catch (Exception error) { Console.WriteLine("PAYLOAD CACHE CHECK FAILED: " + error.Message); throw; }
 
 sealed class MemoryJournal : ITransactionJournal {
  public int Writes; public int FailWrite;
