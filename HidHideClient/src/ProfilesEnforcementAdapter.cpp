@@ -227,7 +227,7 @@ HidHide::Profiles::EnforcementResult CProfilesEnforcementAdapter::AdoptCurrentAs
             m_Transport.clearBlockedRecovery();
         else if (m_RecoveryPending || m_RecoveryBlocked) ClearRecovery();
         m_RecoveryPending = false; m_RecoveryBlocked = false; m_RecoveryAfter = {};
-        m_Baseline = adopted; m_Expected = adopted; m_Conflict = false; return { true, true, std::move(neutral), {} };
+        m_Baseline = adopted; m_Expected = adopted; m_Conflict = false; m_ExternalRequest.reset(); return { true, true, std::move(neutral), {} };
     }
     catch (...) { if (m_RecoveryBlocked) m_Conflict = true; return Failure(L"Current driver settings could not be adopted", true, m_Conflict || m_RecoveryBlocked); }
 }
@@ -275,16 +275,22 @@ HidHide::Configuration CProfilesEnforcementAdapter::PrepareMaintenance()
 void CProfilesEnforcementAdapter::InstallConfigurationChannel()
 {
     if (!m_Proxy) throw std::logic_error("Configuration channel is unavailable for a deterministic enforcement transport");
-    m_Proxy->SetCoordinator([this] { auto current = Read(); current.profiles.clear(); return current; }, [this](auto const& expected, auto const& desired, bool)
-    {
-        if (m_RecoveryBlocked || m_Conflict) throw std::runtime_error("Driver recovery or external-state conflict is unresolved");
-        if (expected.profiles != desired.profiles) throw std::invalid_argument("Legacy profile mutation commands are not supported; use HidHide Profiles");
-        HidHide::Maintenance::Admission admission(m_Transport.admissionName.c_str(), m_Transport.barrierName.c_str()); auto live = HidHide::DriverState(Read());
-        if (live != HidHide::DriverState(expected) || live != m_Expected) throw std::runtime_error("Driver state changed before CLI commit");
-        Commit(live, HidHide::DriverState(desired));
-        // This explicit request is external to the authoritative JSON policy.
-        // Keep the prior expected tuple so the next reconciliation reports a
-        // conflict instead of silently erasing the CLI-requested state.
-        m_Conflict = true;
-    });
+    m_Proxy->SetCoordinator([this] { auto current = Read(); current.profiles.clear(); return current; },
+        [this](auto const& expected, auto const& desired, bool) { CommitExternalRequest(expected, desired); });
+}
+
+void CProfilesEnforcementAdapter::CommitExternalRequest(HidHide::Configuration const& expected, HidHide::Configuration const& desired)
+{
+    // A conflict raised only by earlier CLI requests does not refuse another
+    // one (feeder installers call --app-reg repeatedly), provided the driver
+    // still holds exactly what the previous request left.
+    if (m_RecoveryBlocked || (m_Conflict && !m_ExternalRequest)) throw std::runtime_error("Driver recovery or external-state conflict is unresolved");
+    if (expected.profiles != desired.profiles) throw std::invalid_argument("Legacy profile mutation commands are not supported; use HidHide Profiles");
+    HidHide::Maintenance::Admission admission(m_Transport.admissionName.c_str(), m_Transport.barrierName.c_str()); auto live = HidHide::DriverState(Read());
+    if (live != HidHide::DriverState(expected) || live != (m_ExternalRequest ? *m_ExternalRequest : m_Expected)) throw std::runtime_error("Driver state changed before CLI commit");
+    Commit(live, HidHide::DriverState(desired));
+    // This explicit request is external to the authoritative JSON policy.
+    // Keep the prior expected tuple so the next reconciliation reports a
+    // conflict instead of silently erasing the CLI-requested state.
+    m_ExternalRequest = HidHide::DriverState(desired); m_Conflict = true;
 }

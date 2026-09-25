@@ -228,6 +228,28 @@ namespace
             auto opaqueAdopted = opaque.AdoptCurrentAsBaseline(); if (!opaqueAdopted.success || !opaque.Observe().success) throw std::runtime_error("opaque Allowed-app entries could not be adopted");
         }
         {
+            // Feeder installers call --app-reg more than once while the engine
+            // runs. Only the conflict raised by earlier CLI requests may be
+            // stacked on; any other change in between is still refused.
+            HidHide::Configuration cliState;
+            CProfilesEnforcementAdapter cli(IsolatedProfileTestTransport(ProfilesDriverTransport{ [&] { return cliState; },
+                [&](auto const& expected, auto const& requested)
+                {
+                    if (HidHide::DriverState(cliState) != expected) throw std::runtime_error("test transport CAS mismatch");
+                    HidHide::SetDriverState(cliState, requested);
+                }, false }));
+            auto first = cliState; first.whitelist.emplace(L"\\Device\\HarddiskVolume9\\FeederA.exe");
+            cli.CommitExternalRequest(cliState, first);
+            auto second = cliState; second.whitelist.emplace(L"\\Device\\HarddiskVolume9\\FeederB.exe");
+            try { cli.CommitExternalRequest(cliState, second); }
+            catch (std::exception const&) { throw std::runtime_error("a second CLI request after the first was refused"); }
+            if (cliState.whitelist.size() != 2) throw std::runtime_error("CLI requests were not both applied");
+            if (cli.Observe().success) throw std::runtime_error("CLI-requested state was silently accepted as policy");
+            cliState.blacklist.emplace(L"HID\\THIRD\\PARTY"); auto third = cliState; third.whitelist.emplace(L"\\Device\\HarddiskVolume9\\FeederC.exe");
+            bool refused{}; try { cli.CommitExternalRequest(cliState, third); } catch (std::runtime_error const&) { refused = true; }
+            if (!refused || cliState.whitelist.size() != 2) throw std::runtime_error("a CLI request over an unrelated external change was accepted");
+        }
+        {
             HidHide::Configuration legacyState; bool legacyPending{ true }; unsigned writes{}, clears{};
             std::map<std::wstring, std::vector<std::uint8_t>> evidence{
                 { HidHide::ProfileRecovery::LegacyValue, { 1, 2, 3 } }, { L"ForeignValue", { 9 } } };

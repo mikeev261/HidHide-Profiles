@@ -31,6 +31,8 @@ public:
     HidHide::Profiles::EnforcementResult AdoptCurrentAsBaseline() override;
     HidHide::Configuration PrepareMaintenance();
     void InstallConfigurationChannel();
+    // Handler of the CLI configuration channel (for example --app-reg).
+    void CommitExternalRequest(HidHide::Configuration const& expected, HidHide::Configuration const& desired);
 private:
     HidHide::Profiles::DesiredEnforcement ToNeutral(HidHide::DriverConfiguration const& state) const;
     HidHide::DriverConfiguration ToDriver(HidHide::Profiles::DesiredEnforcement const& desired) const;
@@ -46,4 +48,5 @@ private:
     ProfilesDriverTransport m_Transport;
     HidHide::DriverConfiguration m_Baseline, m_Expected, m_RecoveryAfter;
     bool m_RecoveryPending{}, m_RecoveryBlocked{}, m_Conflict{};
+    std::optional<HidHide::DriverConfiguration> m_ExternalRequest; // last CLI-requested state
 };
