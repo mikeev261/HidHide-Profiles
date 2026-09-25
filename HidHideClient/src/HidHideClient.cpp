@@ -601,6 +601,8 @@ namespace
                 if (phase == L"conflict-fresh") enforcement.SetObservationMode(AcceptanceEnforcement::ObservationMode::KnownConflict);
                 bool repairedAllowed = phase == L"repaired-allowed-reload" || phase == L"repaired-allowed-restore";
                 if (repairedAllowed) enforcement.SetAllowedApplications({NormalizeExecutable(root/L"Feeder.exe")}); // e.g. registered with --app-reg
+                bool transientUnknown = phase == L"transient-unknown" || phase == L"transient-unknown-changed";
+                if (transientUnknown) enforcement.SetObservationMode(AcceptanceEnforcement::ObservationMode::Unknown);
                 ProfileApplicationService application(root); auto initial = enforcement.Observe();
                 application.OpenOrCreateObserved(initial.success && initial.observedKnown && !initial.conflict
                     ? std::optional<std::set<std::filesystem::path>>(initial.observed.allowedApplications) : std::nullopt);
@@ -672,6 +674,18 @@ namespace
                     require(coordinator.HasRepositoryDiagnostics(), "restore fixture was not initially blocked");
                     request("{\"command\":\"restore\",\"path\":"+ToUtf8(Escape(root.native()+L"-backup"))+"}");
                     require(!coordinator.HasRepositoryDiagnostics() && coordinator.EffectiveSelectionVerified() && enforcement.Writes() == 1, "restore did not recover and apply immediately");
+                }
+                else if (transientUnknown)
+                {
+                    // A transient startup read failure is not a conflict: once the
+                    // driver can be observed, activation proceeds after the
+                    // deferred Allowed-app comparison, which still catches drift.
+                    require(!coordinator.HasDriverConflict() && enforcement.Writes() == 0, "transient startup observation failure became a conflict or applied blindly");
+                    enforcement.SetObservationMode(AcceptanceEnforcement::ObservationMode::Normal);
+                    if (phase == L"transient-unknown-changed") enforcement.SetAllowedApplications({NormalizeExecutable(root/L"Feeder.exe")});
+                    coordinator.AcceptanceScanNow();
+                    if (phase == L"transient-unknown") require(!coordinator.HasDriverConflict() && enforcement.Writes() == 1, "activation did not resume after the driver became observable");
+                    else require(coordinator.HasDriverConflict() && enforcement.Writes() == 0, "external Allowed-app change was overwritten after a transient observation failure");
                 }
                 else if (repairedAllowed)
                 {

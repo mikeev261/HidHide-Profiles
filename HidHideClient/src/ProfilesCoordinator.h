@@ -77,7 +77,7 @@ private:
     void WorkerMain() noexcept;
     void RepositoryWatcherMain() noexcept;
     void SubmitSnapshot();
-    void CheckDeferredAllowedApplications();
+    bool CheckDeferredAllowedApplications();
     ApplyOutcome Reconcile(HidHide::Profiles::Selection const& selection, bool saved, HidHide::Profiles::SavedVersion version = {});
     void SetVerifiedSelection(HidHide::Profiles::Selection const& selection);
     static HidHide::Profiles::DesiredEnforcement Desired(HidHide::Profiles::Snapshot const& snapshot, HidHide::Profiles::Selection const& selection);

@@ -692,6 +692,22 @@ TEST(ProfileAcceptance, RepositoryRepairRechecksExternalAllowedAppsBeforeApplyin
     }
 }
 
+TEST(ProfileAcceptance, TransientStartupObservationFailureIsNotAConflict)
+{
+    for (auto phase : { L"transient-unknown", L"transient-unknown-changed" })
+    {
+        SCOPED_TRACE(Json::ToUtf8(phase));
+        TempDirectory temp; temp.path = std::filesystem::path(temp.path.parent_path()) / (L"HidHide-Profiles-Restart-Test-" + NewStableId());
+        ProfileRepository repository(temp.path); repository.OpenOrCreate();
+        auto token = NewStableId(); auto readyName = L"Local\\HidHide.Transient.Ready." + token; auto commandName = L"Local\\HidHide.Transient.Command." + token;
+        auto completedName = L"Local\\HidHide.Transient.Completed." + token; HANDLE ready = ::CreateEventW(nullptr, TRUE, FALSE, readyName.c_str());
+        HANDLE command = ::CreateEventW(nullptr, TRUE, FALSE, commandName.c_str()); HANDLE completed = ::CreateEventW(nullptr, TRUE, FALSE, completedName.c_str()); ASSERT_TRUE(ready && command && completed);
+        auto worker = StartRestartWorker(phase, temp.path, readyName, commandName, completedName);
+        EXPECT_EQ(WAIT_OBJECT_0, ::WaitForSingleObject(ready, 10000)); EXPECT_EQ(WAIT_OBJECT_0, ::WaitForSingleObject(completed, 10000));
+        ASSERT_TRUE(::SetEvent(command)); worker.WaitAndVerifyExit(); ::CloseHandle(ready); ::CloseHandle(command); ::CloseHandle(completed);
+    }
+}
+
 TEST(ProfileAcceptance, SavedButEnforcementFailedRemainsDistinctInService)
 {
     TempDirectory temp; temp.path = std::filesystem::path(temp.path.parent_path()) / (L"HidHide-Profiles-Restart-Test-" + NewStableId());

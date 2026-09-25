@@ -94,7 +94,11 @@ CProfilesCoordinator::CProfilesCoordinator(HidHide::Profiles::IEnforcement& enfo
 {
     if (!m_MaintenanceSource) m_MaintenanceSource = [] { return HidHide::Maintenance::Active(); };
     auto observed = initialObservation ? std::move(*initialObservation) : m_Enforcement.Observe();
-    if (!observed.success || !observed.observedKnown) { m_Conflict = true; m_Status = observed.failure.empty() ? L"Driver state is unknown; activation is blocked" : observed.failure; }
+    // An unknown observation (for example a transient read failure) is retried;
+    // only a known conflict blocks activation until it is reviewed.
+    bool observationUnknown = !observed.observedKnown && !observed.conflict;
+    if (observationUnknown) m_Status = observed.failure.empty() ? L"Driver state is unknown; activation will retry" : observed.failure;
+    else if (!observed.success) { m_Conflict = true; m_Status = observed.failure.empty() ? L"Driver state is unknown; activation is blocked" : observed.failure; }
     auto loaded = m_Repository.Inspect(); m_Snapshot = std::move(loaded.snapshot); m_Issues = std::move(loaded.issues);
     m_SettingsVersion = std::move(loaded.settingsVersion); m_ProfileVersions = std::move(loaded.profileVersions);
     bool catalogValid{ m_Issues.empty() }; try { if (!catalogValid) throw std::runtime_error("Profile repository contains invalid files"); HidHide::Profiles::Validate(m_Snapshot); }
@@ -103,7 +107,7 @@ CProfilesCoordinator::CProfilesCoordinator(HidHide::Profiles::IEnforcement& enfo
     {
         catalogValid = false; m_Conflict = true; m_Status = L"Global Allowed apps changed outside HidHide Profiles; activation is blocked until reviewed";
     }
-    m_AllowedApplicationsUnchecked = m_RepositoryInvalid && !m_Conflict;
+    m_AllowedApplicationsUnchecked = (m_RepositoryInvalid || observationUnknown) && !m_Conflict;
     if (catalogValid && m_SystemIntegration)
     {
         try { m_StartupIssue = UpdateAutoStart(m_Snapshot.settings.startWithWindows); }
@@ -282,14 +286,21 @@ void CProfilesCoordinator::RepositoryWatcherMain() noexcept
 // The startup Allowed-app comparison cannot run while the repository is
 // invalid. Run it on the first valid snapshot, so an external change (for
 // example a feeder registered with --app-reg) is reviewed, not overwritten.
-void CProfilesCoordinator::CheckDeferredAllowedApplications()
+// It is also deferred while the driver cannot be observed at startup. Returns
+// false while the comparison is still pending; nothing may be applied then.
+bool CProfilesCoordinator::CheckDeferredAllowedApplications()
 {
-    if (!std::exchange(m_AllowedApplicationsUnchecked, false) || m_Conflict) return;
+    if (!m_AllowedApplicationsUnchecked) return true;
+    if (m_Conflict || m_RepositoryInvalid) return false;
     auto observed = m_Enforcement.Observe();
-    if (!observed.success || !observed.observedKnown)
+    if (!observed.observedKnown && !observed.conflict)
+    { m_Status = observed.failure.empty() ? L"Driver state is unknown; activation will retry" : observed.failure; return false; }
+    m_AllowedApplicationsUnchecked = false;
+    if (!observed.success)
     { m_Conflict = true; m_Status = observed.failure.empty() ? L"Driver state is unknown; activation is blocked" : observed.failure; }
     else if (observed.observed.allowedApplications != m_Snapshot.settings.allowedApplications)
     { m_Conflict = true; m_Status = L"Global Allowed apps changed outside HidHide Profiles; activation is blocked until reviewed"; }
+    return true;
 }
 
 bool CProfilesCoordinator::ReloadRepositoryIfChanged()
@@ -324,6 +335,11 @@ CProfilesCoordinator::ApplyOutcome CProfilesCoordinator::Reconcile(HidHide::Prof
     // unresolved, but no saved=true path may bypass the enforcement block.
     if (m_RepositoryInvalid) { m_EffectiveVerified = false; return { saved, false, false, saved ? L"Saved, but repository validation remains unresolved; nothing was applied." : m_Status, version }; }
     if (m_Conflict) { m_EffectiveVerified = false; return { saved, false, false, saved ? L"Saved. Driver recovery or external-state conflict remains unresolved; nothing was applied." : m_Status, version }; }
+    if (!CheckDeferredAllowedApplications() || m_Conflict)
+    {
+        m_EffectiveVerified = false;
+        return { saved, false, false, saved ? (m_Conflict ? L"Saved. Driver recovery or external-state conflict remains unresolved; nothing was applied." : L"Saved. Driver state could not be observed yet; nothing was applied.") : m_Status, version };
+    }
     if (m_AdoptedNeedsApply && !saved) return { false, false, true, L"Current driver settings were accepted. Press Apply after reviewing global Allowed apps.", version };
     try
     {
