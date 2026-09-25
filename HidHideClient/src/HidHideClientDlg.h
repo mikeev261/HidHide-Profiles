@@ -128,6 +128,8 @@ private:
     bool m_StartHidden{};
     bool m_EditorPrelaunched{};
     bool m_Exiting{};
+    bool m_EngineReleased{};
+    int m_ChannelDispatchDepth{};
     std::atomic_bool m_MaintenancePrepared{};
     bool m_HideNoticeShown{};
     bool m_TrayIconAdded{};

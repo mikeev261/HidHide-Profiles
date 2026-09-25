@@ -741,6 +741,17 @@ TEST(ProfileAcceptance, SessionEndRestoresBaselineOnceWithoutTrayExit)
     ASSERT_TRUE(::SetEvent(command)); worker.WaitAndVerifyExit(); ::CloseHandle(ready); ::CloseHandle(command); ::CloseHandle(completed);
 }
 
+TEST(ProfileAcceptance, SessionEndIsNotUndoneByQueuedProfileChange)
+{
+    TempDirectory temp; temp.path = std::filesystem::path(temp.path.parent_path()) / (L"HidHide-Profiles-Restart-Test-" + NewStableId());
+    auto token = NewStableId(); auto readyName = L"Local\\HidHide.EndSessionTick.Ready." + token; auto commandName = L"Local\\HidHide.EndSessionTick.Command." + token;
+    auto completedName = L"Local\\HidHide.EndSessionTick.Completed." + token; HANDLE ready = ::CreateEventW(nullptr, TRUE, FALSE, readyName.c_str());
+    HANDLE command = ::CreateEventW(nullptr, TRUE, FALSE, commandName.c_str()); HANDLE completed = ::CreateEventW(nullptr, TRUE, FALSE, completedName.c_str()); ASSERT_TRUE(ready && command && completed);
+    auto worker = StartRestartWorker(L"end-session-pending-tick", temp.path, readyName, commandName, completedName);
+    ASSERT_EQ(WAIT_OBJECT_0, ::WaitForSingleObject(ready, 10000)); ASSERT_EQ(WAIT_OBJECT_0, ::WaitForSingleObject(completed, 10000));
+    ASSERT_TRUE(::SetEvent(command)); worker.WaitAndVerifyExit(); ::CloseHandle(ready); ::CloseHandle(command); ::CloseHandle(completed);
+}
+
 TEST(ProfileAcceptance, KnownConflictAndUnknownReadbackRemainDistinctInService)
 {
     for (auto phase : { L"verified-observation", L"known-observation", L"known-observation-allowed-change", L"unknown-observation" })

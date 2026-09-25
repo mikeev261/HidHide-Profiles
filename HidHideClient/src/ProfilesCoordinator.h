@@ -76,6 +76,7 @@ private:
     bool CanReconcileScan(bool complete) const;
     void WorkerMain() noexcept;
     void RepositoryWatcherMain() noexcept;
+    bool StopRequested();
     void SubmitSnapshot();
     bool CheckDeferredAllowedApplications();
     ApplyOutcome Reconcile(HidHide::Profiles::Selection const& selection, bool saved, HidHide::Profiles::SavedVersion version = {});

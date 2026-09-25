@@ -641,6 +641,48 @@ namespace
                 require(enforcement.Restores() == before + 1, "baseline was restored more than once");
                 finish();
             }
+            else if (phase == L"end-session-pending-tick")
+            {
+                // A profile change queued before WM_ENDSESSION (apps start and stop
+                // during logoff) must not re-apply hiding after the restore. Restart
+                // Manager closes keep the process alive, so pump what is left.
+                {
+                    ProfileApplicationService application(root); application.OpenOrCreate();
+                    Profile race; race.id = NewStableId(); race.name = L"Race"; race.kind = Kind::Application;
+                    race.executable = NormalizeExecutable(root/L"Race.exe");
+                    race.rules.push_back({L"HID\\RACE_PEDALS", L"Race pedals", Visibility::Hidden});
+                    application.Apply(race, std::nullopt);
+                }
+                std::atomic_bool running{};
+                auto executable = NormalizeExecutable(root/L"Race.exe");
+                ProfilesAcceptanceContext context{root, enforcement, devices, [&]
+                { return running.load() ? std::vector<ProcessObservation>{{4343, 1, L"Race.exe", executable, true}} : std::vector<ProcessObservation>{}; }};
+                CHidHideClientDlg dialog(nullptr, context);
+                require(dialog.Create(IDD_DIALOG_APPLICATION) != FALSE, "hidden engine window creation failed");
+                auto pump = [](DWORD milliseconds)
+                {
+                    MSG message{}; auto deadline = ::GetTickCount64() + milliseconds;
+                    while (::GetTickCount64() < deadline) { while (::PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) { ::TranslateMessage(&message); ::DispatchMessageW(&message); } ::Sleep(10); }
+                };
+                pump(1000);
+                auto hidden = [&] { return enforcement.Observe().observed.hiddenDevices.size(); };
+                auto hiddenBefore = hidden();
+                // The worker publishes the running application while the UI thread is
+                // busy; its WM_PROFILE_CHANGED is still queued when the session ends.
+                running = true; ::Sleep(1500);
+                MSG queued{}; auto pending = ::PeekMessageW(&queued, dialog.m_hWnd, WM_APP, 0xBFFF, PM_NOREMOVE) != FALSE;
+                auto before = enforcement.Restores();
+                dialog.SendMessageW(WM_ENDSESSION, TRUE, ENDSESSION_CLOSEAPP);
+                auto writesAfterEnd = enforcement.Writes(); auto hiddenAfterEnd = hidden();
+                pump(1000);
+                auto writesAfterPump = enforcement.Writes(); auto hiddenAfterPump = hidden();
+                if (::IsWindow(dialog.m_hWnd)) dialog.DestroyWindow(); // Never unwind with a live HWND.
+                require(hiddenBefore == 0 && pending, "fixture did not queue a profile change before the session ended");
+                require(enforcement.Restores() == before + 1 && hiddenAfterEnd == 0, "session end did not restore the baseline");
+                require(writesAfterPump == writesAfterEnd && hiddenAfterPump == 0, "queued profile change re-applied hiding after the session-end restore");
+                require(hidden() == 0, "devices remained hidden after the engine closed");
+                finish();
+            }
             else
             {
                 if (phase == L"unknown-fresh") enforcement.SetObservationMode(AcceptanceEnforcement::ObservationMode::Unknown);
