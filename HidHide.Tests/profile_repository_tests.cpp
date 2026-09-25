@@ -669,6 +669,24 @@ TEST(ProfileAcceptance, ValidatedRestoreImmediatelyClearsRepositoryBlockAndAppli
     std::error_code ignored; std::filesystem::remove_all(backup, ignored);
 }
 
+TEST(ProfileAcceptance, RepositoryRepairRechecksExternalAllowedAppsBeforeApplying)
+{
+    for (auto phase : { L"repaired-allowed-reload", L"repaired-allowed-restore" })
+    {
+        SCOPED_TRACE(Json::ToUtf8(phase));
+        TempDirectory temp; temp.path = std::filesystem::path(temp.path.parent_path()) / (L"HidHide-Profiles-Restart-Test-" + NewStableId());
+        ProfileRepository repository(temp.path); repository.OpenOrCreate(); auto backup = std::filesystem::path(temp.path.native() + L"-backup"); repository.Backup(backup);
+        auto settings = temp.path / L"settings.json"; std::ofstream corrupt(settings, std::ios::binary | std::ios::trunc); corrupt << "{"; corrupt.close();
+        auto token = NewStableId(); auto readyName = L"Local\\HidHide.Repair.Ready." + token; auto commandName = L"Local\\HidHide.Repair.Command." + token;
+        auto completedName = L"Local\\HidHide.Repair.Completed." + token; HANDLE ready = ::CreateEventW(nullptr, TRUE, FALSE, readyName.c_str());
+        HANDLE command = ::CreateEventW(nullptr, TRUE, FALSE, commandName.c_str()); HANDLE completed = ::CreateEventW(nullptr, TRUE, FALSE, completedName.c_str()); ASSERT_TRUE(ready && command && completed);
+        auto worker = StartRestartWorker(phase, temp.path, readyName, commandName, completedName);
+        EXPECT_EQ(WAIT_OBJECT_0, ::WaitForSingleObject(ready, 10000)); EXPECT_EQ(WAIT_OBJECT_0, ::WaitForSingleObject(completed, 10000));
+        ASSERT_TRUE(::SetEvent(command)); worker.WaitAndVerifyExit(); ::CloseHandle(ready); ::CloseHandle(command); ::CloseHandle(completed);
+        std::error_code ignored; std::filesystem::remove_all(backup, ignored);
+    }
+}
+
 TEST(ProfileAcceptance, SavedButEnforcementFailedRemainsDistinctInService)
 {
     TempDirectory temp; temp.path = std::filesystem::path(temp.path.parent_path()) / (L"HidHide-Profiles-Restart-Test-" + NewStableId());

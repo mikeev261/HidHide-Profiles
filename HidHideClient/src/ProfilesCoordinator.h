@@ -77,6 +77,7 @@ private:
     void WorkerMain() noexcept;
     void RepositoryWatcherMain() noexcept;
     void SubmitSnapshot();
+    void CheckDeferredAllowedApplications();
     ApplyOutcome Reconcile(HidHide::Profiles::Selection const& selection, bool saved, HidHide::Profiles::SavedVersion version = {});
     void SetVerifiedSelection(HidHide::Profiles::Selection const& selection);
     static HidHide::Profiles::DesiredEnforcement Desired(HidHide::Profiles::Snapshot const& snapshot, HidHide::Profiles::Selection const& selection);
@@ -98,6 +99,7 @@ private:
     std::wstring m_StartupIssue;
     bool m_Conflict{};
     bool m_RepositoryInvalid{};
+    bool m_AllowedApplicationsUnchecked{};
     bool m_AdoptedNeedsApply{};
     bool m_EffectiveVerified{};
     std::uint64_t m_RepositoryWrites{};
