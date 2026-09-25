@@ -251,6 +251,7 @@ Reject(() => crashRecovery.Rollback(), "reloaded inverse intent cannot restart")
 Reject(() => crashRecovery.ResumeAfterReboot("3"), "reloaded inverse intent cannot resume");
 Check(crashUndo.Calls.Count == crashCalls, "completion-write crash does not replay native inverse");
 Console.WriteLine($"{checks} driver transaction checks passed.");
+Console.WriteLine($"{DirectMsiFlowChecks.Run()} direct MSI flow checks passed.");
 
 sealed class MemoryJournal : ITransactionJournal {
  public int Writes; public int FailWrite;
