@@ -1323,3 +1323,43 @@ TEST(ProcessLifetimeCache, RecycledPidDuringIncompleteInactiveGapExpiresPinAfter
     EXPECT_EQ((std::vector<std::wstring>{f.c,f.a,f.b}),f.history.Running());
     cache.ConsumeExited(); EXPECT_EQ(f.a,f.Scan({b,successor}));
 }
+
+TEST(ProfileJson, NumbersAcceptOnlyAsciiDigits)
+{
+    // #30: iswdigit also classifies fullwidth and other Unicode digits.
+    for (std::wstring text : { L"\xFF11", L"1\xFF10", L"\x0661", L"-\xFF11", L"7\x0664" })
+        EXPECT_THROW(Json::Parser(text).Parse(), std::runtime_error) << Json::ToUtf8(text);
+    EXPECT_EQ(42u, std::get<std::uint64_t>(Json::Parser(L"42").Parse().data));
+}
+
+TEST(ProfileJson, AllowedAppsDifferingOnlyInCaseRoundTrip)
+{
+    // #27: entries that normalize to the same path must be written once.
+    Settings settings{ 1, L"00000000-0000-0000-0000-000000000001", Mode::Automatic, false, false, {} };
+    settings.allowedApplications = { L"C:\\Feeders\\Gremlin.exe", L"c:\\feeders\\gremlin.exe" };
+    Settings parsed; EXPECT_NO_THROW(parsed = ParseSettings(SerializeSettings(settings)));
+    EXPECT_EQ(1u, parsed.allowedApplications.size());
+}
+
+TEST(ProfileDomain, ExecutableMatchingFoldsNonAsciiCase)
+{
+    // #28: Windows paths are case-insensitive beyond ASCII.
+    std::wstring upper{ L"C:\\Spiele\\" }; upper += L'\x00C4'; upper += L"RGER.exe";
+    std::wstring lower{ L"c:\\spiele\\" }; lower += L'\x00E4'; lower += L"rger.exe";
+    EXPECT_TRUE(NormalizeExecutable(upper) == NormalizeExecutable(lower));
+    std::wstring cyrillicUpper{ L"C:\\" }; for (wchar_t c : { L'\x0418', L'\x0413', L'\x0420', L'\x042B' }) cyrillicUpper += c; cyrillicUpper += L"\\GAME.EXE";
+    std::wstring cyrillicLower{ L"c:\\" }; for (wchar_t c : { L'\x0438', L'\x0433', L'\x0440', L'\x044B' }) cyrillicLower += c; cyrillicLower += L"\\game.exe";
+    EXPECT_TRUE(NormalizeExecutable(cyrillicUpper) == NormalizeExecutable(cyrillicLower));
+}
+
+TEST(ProfileRepository, OversizedCatalogFileIsRejectedBeforeAnyWrite)
+{
+    // #26: a valid profile can serialize beyond the 4 MiB read limit.
+    TempDirectory temp; ProfileRepository repository(temp.path); repository.OpenOrCreate(); auto before = RepositoryBytes(temp.path);
+    std::vector<DeviceRule> rules;
+    for (std::size_t i{}; i < 200; ++i) rules.push_back({ L"HID\\VID_1234&PID_" + std::to_wstring(i) + L"\\" + std::wstring(30000, L'X'), L"", Visibility::Hidden });
+    auto huge = App(NewStableId(), L"Huge", 1, L"C:\\Games\\Huge.exe", rules); ASSERT_NO_THROW(Validate(huge));
+    EXPECT_THROW(repository.Apply(huge, std::nullopt), std::invalid_argument);
+    EXPECT_EQ(before, RepositoryBytes(temp.path));
+    LoadResult loaded; EXPECT_NO_THROW(loaded = RepositoryView(temp.path).Load()); EXPECT_TRUE(loaded.issues.empty());
+}
