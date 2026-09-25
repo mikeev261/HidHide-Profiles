@@ -341,6 +341,9 @@ CProfilesCoordinator::ApplyOutcome CProfilesCoordinator::Reconcile(HidHide::Prof
         return { saved, false, false, saved ? (m_Conflict ? L"Saved. Driver recovery or external-state conflict remains unresolved; nothing was applied." : L"Saved. Driver state could not be observed yet; nothing was applied.") : m_Status, version };
     }
     if (m_AdoptedNeedsApply && !saved) return { false, false, true, L"Current driver settings were accepted. Press Apply after reviewing global Allowed apps.", version };
+    // Stop() has restored the baseline; nothing may hide devices again after it,
+    // including a queued or re-entrant request that runs before the window dies.
+    if (StopRequested()) { m_EffectiveVerified = false; return { saved, false, false, saved ? L"Saved. HidHide Profiles is closing; nothing was applied." : L"HidHide Profiles is closing", version }; }
     try
     {
         if (m_MaintenanceSource()) return { saved, false, false, saved ? L"Saved. Setup maintenance is active; nothing was activated." : L"Setup maintenance is active", version };
@@ -589,6 +592,7 @@ HidHide::Profiles::EnforcementResult CProfilesCoordinator::ObserveEnforcement()
 
 void CProfilesCoordinator::Tick()
 {
+    if (StopRequested()) return;
     try
     {
         if (m_MaintenanceSource()) { m_EffectiveVerified = false; m_Status = L"Setup maintenance is active; profile monitoring is suspended"; return; }
@@ -655,6 +659,7 @@ std::set<std::filesystem::path> CProfilesCoordinator::AdoptExternalState()
         m_Issues.clear(); m_Issues.push_back({ m_Repository.Root(), std::wstring(error.what(), error.what() + strlen(error.what())) });
         throw std::logic_error("The JSON repository changed while confirmation was open; current driver settings were not adopted");
     }
+    if (StopRequested()) throw std::runtime_error("HidHide Profiles is closing; current driver settings were not adopted");
     auto result = m_Enforcement.AdoptCurrentAsBaseline(); if (!result.success || !result.observedKnown) throw std::runtime_error("Current driver settings could not be adopted");
     m_Conflict = false; m_Status = L"Current driver settings accepted; review the staged global Allowed apps and press Apply"; m_AdoptedNeedsApply = true;
     return result.observed.allowedApplications;
@@ -710,6 +715,9 @@ CProfilesCoordinator::ApplyOutcome CProfilesCoordinator::AbandonAdoptionDraft()
     else outcome.message = L"Adopted Allowed-app changes were discarded. The saved profile policy still needs activation. " + outcome.message;
     return outcome;
 }
+
+bool CProfilesCoordinator::StopRequested()
+{ std::lock_guard<std::mutex> lock(m_WorkerMutex); return m_StopRequested; }
 
 void CProfilesCoordinator::Stop() noexcept
 {

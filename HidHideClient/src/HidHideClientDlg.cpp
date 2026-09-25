@@ -73,6 +73,8 @@ BEGIN_MESSAGE_MAP(CHidHideClientDlg, CDialogEx)
     ON_WM_WINDOWPOSCHANGING()
     ON_WM_CLOSE()
     ON_WM_DESTROY()
+    ON_WM_QUERYENDSESSION()
+    ON_WM_ENDSESSION()
     ON_WM_SYSCOMMAND()
     ON_MESSAGE(WM_DEVICES_CHANGED, &CHidHideClientDlg::OnDevicesChanged)
     ON_MESSAGE(WM_PROFILE_CHANGED, &CHidHideClientDlg::OnProfileChanged)
@@ -417,6 +419,37 @@ void CHidHideClientDlg::OnOK()
 
 void CHidHideClientDlg::OnDestroy()
 {
+    ReleaseEngine();
+    CDialogEx::OnDestroy();
+}
+
+BOOL CHidHideClientDlg::OnQueryEndSession()
+{
+    // Never veto and never restore here: the session end may still be cancelled.
+    return TRUE;
+}
+
+void CHidHideClientDlg::OnEndSession(BOOL ending)
+{
+    // Logoff and shutdown terminate the process soon after this returns, without
+    // WM_DESTROY; a Restart Manager close (ENDSESSION_CLOSEAPP) expects the app to
+    // exit by itself, which OnCancel below does. Stop the engine and restore the
+    // baseline now, as tray Exit does; if restoration is not confirmed the
+    // recovery record is kept so the next start recovers. The released engine
+    // ignores anything still queued, so nothing hides devices after the restore.
+    // A cancelled session end changes nothing.
+    if (!ending) return;
+    auto const blocking{ ::ShutdownBlockReasonCreate(m_hWnd, L"Restoring HidHide device settings") != FALSE };
+    m_Exiting = true;
+    ReleaseEngine();
+    if (blocking) ::ShutdownBlockReasonDestroy(m_hWnd);
+    CDialogEx::OnCancel();
+}
+
+// Idempotent: runs from WM_ENDSESSION and again from WM_DESTROY.
+void CHidHideClientDlg::ReleaseEngine()
+{
+    m_EngineReleased = true;
     if (!m_Acceptance) ::RemovePropW(m_hWnd, HidHide::ManagerActivation::WindowProperty);
     if (m_DeviceNotification)
     {
@@ -431,14 +464,19 @@ void CHidHideClientDlg::OnDestroy()
     {
         auto dispatch = reinterpret_cast<ChannelDispatch*>(pending.lParam); dispatch->cancelled = true; dispatch->Release();
     }
+    // Queued engine notifications must not re-apply a profile after the restore.
+    while (::PeekMessageW(&pending, m_hWnd, WM_PROFILE_CHANGED, WM_PROFILE_CHANGED, PM_REMOVE)) {}
+    while (::PeekMessageW(&pending, m_hWnd, WM_DEVICES_CHANGED, WM_DEVICES_CHANGED, PM_REMOVE)) {}
     m_ConfigurationServer.reset();
-    m_EditorServer.reset(); m_EditorService.reset();
+    // WM_ENDSESSION is sent, so it can arrive in a nested loop under an editor
+    // dispatch; the outer frame still uses the service, which the dialog
+    // destructor releases instead. The stopped coordinator refuses its writes.
+    m_EditorServer.reset(); if (!m_ChannelDispatchDepth) m_EditorService.reset();
     if (m_ChannelStop) { ::CloseHandle(m_ChannelStop); m_ChannelStop = nullptr; }
     if (m_DeviceStop) { ::CloseHandle(m_DeviceStop); m_DeviceStop = nullptr; }
     if (m_DeviceWake) { ::CloseHandle(m_DeviceWake); m_DeviceWake = nullptr; }
     if (m_ProfilesCoordinator) { m_ProfilesCoordinator->SetNotificationWindow(nullptr, 0); m_ProfilesCoordinator->Stop(); }
     RemoveTrayIcon();
-    CDialogEx::OnDestroy();
 }
 
 _Use_decl_annotations_
@@ -501,6 +539,7 @@ LRESULT CHidHideClientDlg::OnTaskbarCreated(WPARAM wParam, LPARAM lParam)
 {
     UNREFERENCED_PARAMETER(wParam);
     UNREFERENCED_PARAMETER(lParam);
+    if (m_EngineReleased) return 0;
     AddTrayIcon();
     UpdateTrayTooltip();
     return 0;
@@ -519,12 +558,14 @@ void CHidHideClientDlg::SetEnabled(bool displayed, bool requested)
 
 LRESULT CHidHideClientDlg::OnDevicesChanged(WPARAM, LPARAM)
 {
+    if (m_EngineReleased) return 0;
     if (m_DeviceWake) ::SetEvent(m_DeviceWake);
     return 0;
 }
 
 LRESULT CHidHideClientDlg::OnProfileChanged(WPARAM repositoryChange, LPARAM)
 {
+    if (m_EngineReleased) return 0;
     if (repositoryChange && m_ProfilesCoordinator) m_ProfilesCoordinator->ReloadRepositoryIfChanged();
     if (m_ProfilesCoordinator) m_ProfilesCoordinator->Tick();
     UpdateTrayTooltip();
@@ -540,6 +581,7 @@ LRESULT CHidHideClientDlg::OnChannelStateChanged(WPARAM maintenanceComplete, LPA
 LRESULT CHidHideClientDlg::OnChannelRequest(WPARAM, LPARAM value)
 {
     auto& dispatch = *reinterpret_cast<ChannelDispatch*>(value);
+    ++m_ChannelDispatchDepth;
     try
     {
         if (m_Exiting || dispatch.cancelled) throw std::runtime_error("HidHide Profiles is closing");
@@ -555,5 +597,6 @@ LRESULT CHidHideClientDlg::OnChannelRequest(WPARAM, LPARAM value)
         UpdateTrayTooltip();
     }
     catch (...) { dispatch.failure = std::current_exception(); }
+    --m_ChannelDispatchDepth;
     ::SetEvent(dispatch.completed); dispatch.Release(); return TRUE;
 }

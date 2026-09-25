@@ -38,10 +38,11 @@ namespace
             if (m_FailReconcile) return { false, false, {}, L"Injected deterministic enforcement failure" };
             m_State = desired; m_Baseline.allowedApplications = desired.allowedApplications; ++m_Writes; return { true, true, m_State, {} };
         }
-        HidHide::Profiles::EnforcementResult RestoreBaseline() override { m_State = m_Baseline; return { true, true, m_State, {} }; }
+        HidHide::Profiles::EnforcementResult RestoreBaseline() override { ++m_Restores; m_State = m_Baseline; return { true, true, m_State, {} }; }
         HidHide::Profiles::EnforcementResult AdoptCurrentAsBaseline() override { ++m_Adoptions; m_RecoveryEvidence.clear(); m_Baseline = m_State; return { true, true, m_State, {} }; }
         std::uint64_t Writes() const noexcept { return m_Writes; }
         std::uint64_t Adoptions() const noexcept { return m_Adoptions; }
+        std::uint64_t Restores() const noexcept { return m_Restores; }
         std::vector<std::uint8_t> RecoveryEvidence() const { return m_RecoveryEvidence; }
         void FailReconcile(bool value) noexcept { m_FailReconcile = value; }
         void SetObservationMode(ObservationMode value) noexcept { m_ObservationMode = value; }
@@ -50,6 +51,7 @@ namespace
         HidHide::Profiles::DesiredEnforcement m_State, m_Baseline;
         std::uint64_t m_Writes{};
         std::uint64_t m_Adoptions{};
+        std::uint64_t m_Restores{};
         bool m_FailReconcile{};
         ObservationMode m_ObservationMode{ ObservationMode::Normal };
         std::vector<std::uint8_t> m_RecoveryEvidence{ 0x52, 0x45, 0x43, 0x56 };
@@ -670,6 +672,70 @@ namespace
                 require(!dialog.IsWindowVisible(), "resident fixture unexpectedly became visible");
                 require(dialog.AcceptanceDeviceBurstCoalesced(), "device burst was not bounded and coalesced");
                 dialog.DestroyWindow(); finish();
+            }
+            else if (phase == L"end-session")
+            {
+                // Logoff/shutdown terminates the process after WM_ENDSESSION returns,
+                // so the baseline must be restored inside that message, once.
+                ProfilesAcceptanceContext context{root, enforcement, devices, [] { return std::vector<ProcessObservation>{}; }};
+                CHidHideClientDlg dialog(nullptr, context);
+                require(dialog.Create(IDD_DIALOG_APPLICATION) != FALSE, "hidden engine window creation failed");
+                auto before = enforcement.Restores();
+                auto allowed = dialog.SendMessageW(WM_QUERYENDSESSION, 0, ENDSESSION_LOGOFF) == TRUE;
+                auto afterQuery = enforcement.Restores();
+                dialog.SendMessageW(WM_ENDSESSION, FALSE, ENDSESSION_LOGOFF);
+                auto afterCancel = enforcement.Restores(); auto aliveAfterCancel = ::IsWindow(dialog.m_hWnd) != FALSE;
+                dialog.SendMessageW(WM_ENDSESSION, TRUE, ENDSESSION_LOGOFF);
+                auto afterEnd = enforcement.Restores();
+                if (::IsWindow(dialog.m_hWnd)) dialog.DestroyWindow(); // Never unwind with a live HWND.
+                require(allowed, "session end was vetoed");
+                require(afterQuery == before, "session end query restored before the end was confirmed");
+                require(afterCancel == before && aliveAfterCancel, "cancelled session end was destructive");
+                require(afterEnd == before + 1, "session end did not restore the baseline");
+                require(enforcement.Restores() == before + 1, "baseline was restored more than once");
+                finish();
+            }
+            else if (phase == L"end-session-pending-tick")
+            {
+                // A profile change queued before WM_ENDSESSION (apps start and stop
+                // during logoff) must not re-apply hiding after the restore. Restart
+                // Manager closes keep the process alive, so pump what is left.
+                {
+                    ProfileApplicationService application(root); application.OpenOrCreate();
+                    Profile race; race.id = NewStableId(); race.name = L"Race"; race.kind = Kind::Application;
+                    race.executable = NormalizeExecutable(root/L"Race.exe");
+                    race.rules.push_back({L"HID\\RACE_PEDALS", L"Race pedals", Visibility::Hidden});
+                    application.Apply(race, std::nullopt);
+                }
+                std::atomic_bool running{};
+                auto executable = NormalizeExecutable(root/L"Race.exe");
+                ProfilesAcceptanceContext context{root, enforcement, devices, [&]
+                { return running.load() ? std::vector<ProcessObservation>{{4343, 1, L"Race.exe", executable, true}} : std::vector<ProcessObservation>{}; }};
+                CHidHideClientDlg dialog(nullptr, context);
+                require(dialog.Create(IDD_DIALOG_APPLICATION) != FALSE, "hidden engine window creation failed");
+                auto pump = [](DWORD milliseconds)
+                {
+                    MSG message{}; auto deadline = ::GetTickCount64() + milliseconds;
+                    while (::GetTickCount64() < deadline) { while (::PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) { ::TranslateMessage(&message); ::DispatchMessageW(&message); } ::Sleep(10); }
+                };
+                pump(1000);
+                auto hidden = [&] { return enforcement.Observe().observed.hiddenDevices.size(); };
+                auto hiddenBefore = hidden();
+                // The worker publishes the running application while the UI thread is
+                // busy; its WM_PROFILE_CHANGED is still queued when the session ends.
+                running = true; ::Sleep(1500);
+                MSG queued{}; auto pending = ::PeekMessageW(&queued, dialog.m_hWnd, WM_APP, 0xBFFF, PM_NOREMOVE) != FALSE;
+                auto before = enforcement.Restores();
+                dialog.SendMessageW(WM_ENDSESSION, TRUE, ENDSESSION_CLOSEAPP);
+                auto writesAfterEnd = enforcement.Writes(); auto hiddenAfterEnd = hidden();
+                pump(1000);
+                auto writesAfterPump = enforcement.Writes(); auto hiddenAfterPump = hidden();
+                if (::IsWindow(dialog.m_hWnd)) dialog.DestroyWindow(); // Never unwind with a live HWND.
+                require(hiddenBefore == 0 && pending, "fixture did not queue a profile change before the session ended");
+                require(enforcement.Restores() == before + 1 && hiddenAfterEnd == 0, "session end did not restore the baseline");
+                require(writesAfterPump == writesAfterEnd && hiddenAfterPump == 0, "queued profile change re-applied hiding after the session-end restore");
+                require(hidden() == 0, "devices remained hidden after the engine closed");
+                finish();
             }
             else
             {
