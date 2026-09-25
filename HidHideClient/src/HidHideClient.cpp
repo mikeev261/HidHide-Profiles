@@ -139,6 +139,38 @@ namespace
             if (!running->RestoreBaseline().success) throw std::runtime_error("baseline restoration after adoption failed");
             requireOriginalBaselineWithExternalChange(restart ? "adoption after restart made profile hiding the baseline" : "adoption made profile hiding the baseline");
         }
+        // A profile switch whose driver commit fails, before any change or part
+        // way, leaves HidHide's own state behind; adoption must not mistake it
+        // for an external change. Here the switch pauses hiding.
+        for (bool partial : { false, true })
+        {
+            HidHide::Configuration adoptState; std::optional<std::vector<std::uint8_t>> stored; bool failNextCommit{};
+            auto transport = IsolatedProfileTestTransport(ProfilesDriverTransport{
+                [&] { return adoptState; },
+                [&](auto const& expected, auto const& requested)
+                {
+                    if (HidHide::DriverState(adoptState) != expected) throw std::runtime_error("test transport CAS mismatch");
+                    if (!std::exchange(failNextCommit, false)) { HidHide::SetDriverState(adoptState, requested); return; }
+                    // Partial: the device list is written, the active flag write fails.
+                    if (partial) { auto written = requested; written.active = expected.active; HidHide::SetDriverState(adoptState, written); }
+                    throw std::runtime_error("injected IOCTL failure");
+                }, true,
+                [&] { return stored; }, [&](auto const& bytes) { stored = bytes; }, [&] { stored.reset(); } });
+            CProfilesEnforcementAdapter running(transport);
+            if (!running.Reconcile(desired).success) throw std::runtime_error("profile hiding was not applied");
+            failNextCommit = true; auto paused = desired; paused.hidingEnabled = false; paused.hiddenDevices.clear();
+            if (running.Reconcile(paused).success) throw std::runtime_error("injected commit failure was not reported");
+            if (!partial)
+            {
+                auto external = adoptState; external.whitelist.emplace(feederImage);
+                running.CommitExternalRequest(adoptState, external);
+            }
+            if (running.Observe().success) throw std::runtime_error("changed driver state was not reported as a conflict");
+            if (!running.AdoptCurrentAsBaseline().success) throw std::runtime_error("driver state after a failed switch could not be adopted");
+            if (!running.RestoreBaseline().success) throw std::runtime_error("baseline restoration after a failed switch failed");
+            if (adoptState.active || !adoptState.blacklist.empty() || adoptState.whitelist.size() != (partial ? 0u : 1u) || stored)
+                throw std::runtime_error(partial ? "adoption after a partial profile switch kept HidHide's own hiding" : "adoption after a failed profile switch kept profile hiding");
+        }
     }
 
     bool ExerciseProductionEnforcementAdapter()

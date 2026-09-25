@@ -40,8 +40,10 @@ and remain paused. This action does not write the old baseline over external edi
 When a trustworthy record of what HidHide Profiles applied exists (in-process, or a
 parseable same-user recovery record even if it no longer matches the driver), only
 what changed outside HidHide Profiles is accepted: each driver flag, and each
-blacklist or whitelist entry, takes the observed value where it differs from what
-was applied and otherwise keeps the original baseline. Profile hiding therefore
+blacklist or whitelist entry, takes the observed value where it differs from both
+states HidHide Profiles recorded for its last attempt (what it held before, and what
+it requested; a failed commit can leave either, or part of each) and otherwise keeps
+the original baseline. Profile hiding therefore
 never becomes the baseline, and the recovery record is replaced, not cleared, while
 the driver still holds it. Without such a record (legacy, unreadable or foreign
 evidence) the observed settings become the baseline as a whole and the prior

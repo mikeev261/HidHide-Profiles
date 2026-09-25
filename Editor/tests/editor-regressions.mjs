@@ -62,6 +62,20 @@ await session('imported draft applies after settings changed while its picker wa
  if(!state.settings.allowedApplications.includes('C:\\External\\Feeder.exe'))throw Error('Import undid an external Allowed-app change.');
 });
 
+// Deep hunt #2: leftover recovery evidence and no profile catalog. Accepting the
+// observed baseline must create the catalog instead of demanding saved settings.
+await session('accepting the observed baseline creates a missing profile catalog',async({page,control})=>{
+ await control({uninitializedConflict:true});
+ await expect(page.getByText('Driver settings need review',{exact:true})).toBeVisible({timeout:15000});
+ await page.getByRole('button',{name:'Review recovery',exact:true}).click();
+ await page.getByRole('button',{name:'Accept observed baseline',exact:true}).click();
+ await expect(page.getByRole('heading',{name:'Le Mans Ultimate',exact:true})).toBeVisible({timeout:15000});
+ await expect(page.getByText('Driver settings need review',{exact:true})).toHaveCount(0);
+ const state=await control({});
+ if(state.catalogUninitialized||state.conflict||!state.settingsVersion)throw Error('The catalog was not created: '+JSON.stringify({catalogUninitialized:state.catalogUninitialized,conflict:state.conflict}));
+ if(!state.settings.allowedApplications.includes('C:\\Program Files\\Feeder\\Feeder.exe'))throw Error('The observed Allowed apps were not kept.');
+});
+
 // #21: if the page crashes while rendering, the window must still close.
 await session('editor window closes after the page crashed while rendering',async({app,page,control,isClosed})=>{
  const errors=[];page.on('pageerror',e=>errors.push(e.message));
