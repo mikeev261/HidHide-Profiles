@@ -55,6 +55,24 @@ user, rejects remote clients, and uses a first-instance claim. The global mutex
 permits authenticated users to synchronize ownership, but does not grant them
 access to another user's pipe or profile definitions.
 
+Other local users and named objects:
+
+- The per-user profile repository is serialized by an exclusive `.writer.lock`
+  file inside that user's own repository directory, not by a predictable
+  `Global\` name that another user could pre-create or deny.
+- The MSI handshake events (`Global\HidHide.Profiles.Msi.Ready/Release.<transaction>`)
+  may be signalled only by the initiating user, SYSTEM and Administrators.
+- Elevated setup moves aside any `C:\ProgramData\mikeev261\HidHide\Maintenance`
+  path component that is not a trusted protected directory (another user may
+  create ProgramData children), keeps it as evidence, and recreates it protected.
+- The machine-wide coordination objects (owner and admission mutexes, the
+  maintenance barrier event and the configuration pipe) are shared by design:
+  another user's engine or setup may legitimately hold them, which blocks this
+  user until it releases them, and a user can hold them the same way on purpose.
+  That lasts only while their process runs (the objects cannot outlive it), and
+  the pipe client still refuses a server owned by another user. Removing this
+  residual denial of service would need a privileged broker service.
+
 Messages are limited to 1 MiB, 4096 entries per collection, and 32767 UTF-16 code
 units per string. Parsing rejects truncated data, invalid flags, duplicate entries,
 embedded nulls, and trailing bytes. Client I/O has a five-second timeout; server
