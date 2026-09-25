@@ -164,6 +164,9 @@ Reject(() => SettingsRestoration.Apply(restoreExpected, restoreDesired, () => Co
 Check(!restoreState.Active && !writes.Contains(SettingsField.Inverse), "Restoration failure stops before later fields and enable");
 Reject(() => SettingsRestoration.Apply(restoreExpected, restoreDesired, () => CopySettings(restoreExpected), (_, _) => {}), "False successful writes rejected by read-back");
 Check(new DriverSettings { Whitelist=new byte[2], Blacklist=new byte[4] }.Same(new DriverSettings { Whitelist=new byte[4], Blacklist=new byte[2] }), "Empty multistring representations compare semantically");
+// #15: the exclusive control device held by a feeder or the CLI is present, not missing.
+Check(WindowsDriverBackend.ControlPresent(0) && WindowsDriverBackend.ControlPresent(5) && WindowsDriverBackend.ControlPresent(32), "Busy exclusive control device is present");
+Check(!WindowsDriverBackend.ControlPresent(2) && !WindowsDriverBackend.ControlPresent(3) && !WindowsDriverBackend.ControlPresent(31), "Missing or failed control device is unavailable");
 foreach(var bytes in new[] { new byte[0], new byte[1], new byte[] { 65,0,0,0 }, new byte[] { 0,0,65,0,0,0,0,0 } })
  Reject(() => SettingsCodec.Decode(bytes), "Malformed native list rejected");
 Reject(() => SettingsCodec.Encode(new[] { "same", "same" }), "Duplicate READY list rejected");
