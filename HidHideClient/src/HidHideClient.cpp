@@ -674,7 +674,9 @@ namespace
             else
             {
                 if (phase == L"unknown-fresh") enforcement.SetObservationMode(AcceptanceEnforcement::ObservationMode::Unknown);
-                if (phase == L"conflict-fresh") enforcement.SetObservationMode(AcceptanceEnforcement::ObservationMode::KnownConflict);
+                if (phase == L"conflict-fresh" || phase == L"conflict-fresh-adopt" || phase == L"conflict-incomplete")
+                    enforcement.SetObservationMode(AcceptanceEnforcement::ObservationMode::KnownConflict);
+                if (phase == L"conflict-fresh-adopt") enforcement.SetAllowedApplications({NormalizeExecutable(root/L"Feeder.exe")});
                 bool repairedAllowed = phase == L"repaired-allowed-reload" || phase == L"repaired-allowed-restore";
                 if (repairedAllowed) enforcement.SetAllowedApplications({NormalizeExecutable(root/L"Feeder.exe")}); // e.g. registered with --app-reg
                 bool transientUnknown = phase == L"transient-unknown" || phase == L"transient-unknown-changed";
@@ -729,7 +731,7 @@ namespace
                     require(found != profiles.end() && found->second.name == L"F1 25" && found->second.rules.size() == 2, "saved application did not reload");
                     request("{\"command\":\"snapshot\"}");
                 }
-                else if (phase == L"invalid" || phase == L"unknown-fresh" || phase == L"conflict-fresh")
+                else if (phase == L"invalid" || phase == L"unknown-fresh" || phase == L"conflict-fresh" || phase == L"conflict-incomplete")
                 {
                     auto result = request("{\"command\":\"snapshot\"}"); auto const& snapshot = AsObject(Required(AsObject(result), L"snapshot"));
                     require(!AsArray(Required(snapshot,L"repositoryIssues")).empty() && coordinator.HasRepositoryDiagnostics(), "invalid repository was not blocked");
@@ -740,7 +742,36 @@ namespace
                     auto retry=Parser(FromUtf8(std::string(retryBytes.begin(),retryBytes.end()))).Parse();
                     require(!AsBool(Required(AsObject(retry),L"ok")) || !AsBool(Required(AsObject(retry),L"applied")), "blocked repository retry reported success");
                     request("{\"command\":\"adopt\",\"expectedSettings\":{\"revision\":1,\"hash\":\"invalid\"}}", false);
+                    // Seeding a new catalog is only for a root without any
+                    // catalog evidence and with a driver that can be read.
+                    if (phase != L"conflict-fresh") adopt("null", false);
                     require(enforcement.Writes() == 0 && enforcement.Adoptions() == 0, "blocked service touched driver state");
+                }
+                else if (phase == L"conflict-fresh-adopt")
+                {
+                    // Stale recovery evidence with no catalog: explicit adoption
+                    // is the way out, and the catalog is seeded from it.
+                    auto feeder = NormalizeExecutable(root/L"Feeder.exe");
+                    require(coordinator.HasRepositoryDiagnostics() && coordinator.HasDriverConflict() && !std::filesystem::exists(root/L"settings.json"),
+                        "fresh conflict fixture was not blocked by both repository and driver");
+                    auto before = request("{\"command\":\"snapshot\"}"); auto const& blocked = AsObject(Required(AsObject(before), L"snapshot"));
+                    require(std::holds_alternative<std::nullptr_t>(Required(blocked,L"settingsVersion").data) && AsBool(Required(blocked,L"conflict"))
+                        && AsBool(Required(blocked,L"catalogUninitialized")), "uninitialized catalog was not offered for explicit adoption");
+                    auto adopted = adopt("null");
+                    require(enforcement.Adoptions() == 1 && enforcement.RecoveryEvidence().empty(), "explicit adoption did not clear recovery evidence exactly once");
+                    require(!coordinator.HasDriverConflict() && !coordinator.HasRepositoryDiagnostics() && coordinator.Issues().empty(), "adoption left the engine blocked");
+                    auto loaded = RepositoryView(root).Load();
+                    require(loaded.issues.empty() && loaded.snapshot.settings.allowedApplications == std::set<std::filesystem::path>{feeder}
+                        && coordinator.Snapshot().generation == loaded.snapshot.generation, "catalog was not created from the adopted observation");
+                    require(AsBool(Required(AsObject(adopted),L"saved")) && AsBool(Required(AsObject(adopted),L"applied")) && coordinator.EffectiveSelectionVerified(),
+                        "created catalog was not applied and verified");
+                    enforcement.SetObservationMode(AcceptanceEnforcement::ObservationMode::Normal); // The adopted evidence no longer conflicts.
+                    auto after = request("{\"command\":\"snapshot\"}"); auto const& resolved = AsObject(Required(AsObject(after), L"snapshot"));
+                    require(!std::holds_alternative<std::nullptr_t>(Required(resolved,L"settingsVersion").data) && !AsBool(Required(resolved,L"conflict"))
+                        && AsArray(Required(resolved,L"repositoryIssues")).empty() && !AsBool(Required(resolved,L"catalogUninitialized")), "editor snapshot stayed blocked");
+                    auto settingsBytes = ReadBytes(root/L"settings.json"); adopt("null", false);
+                    require(enforcement.Adoptions() == 1 && settingsBytes == ReadBytes(root/L"settings.json")
+                        && RepositoryView(root).Load().snapshot.generation == loaded.snapshot.generation, "an existing catalog was seeded again");
                 }
                 else if (phase == L"adapter")
                 {

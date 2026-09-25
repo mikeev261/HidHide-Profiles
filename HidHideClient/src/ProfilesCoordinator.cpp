@@ -660,6 +660,35 @@ std::set<std::filesystem::path> CProfilesCoordinator::AdoptExternalState()
     return result.observed.allowedApplications;
 }
 
+bool CProfilesCoordinator::CatalogUninitialized() const
+{
+    try { return m_RepositoryInvalid && m_Repository.CatalogUninitialized(); }
+    catch (...) { return false; }
+}
+
+// A fresh catalog is seeded only from a conflict-free observation. When stale
+// recovery evidence blocks that at first start, and no catalog file exists that
+// could itself be evidence, explicit adoption is the only way out: it clears
+// the evidence through the ordinary adoption path and returns the adopted
+// Allowed apps. The caller then creates the catalog from them and publishes it.
+std::set<std::filesystem::path> CProfilesCoordinator::AdoptExternalStateForNewCatalog()
+{
+    if (!m_RepositoryInvalid || !m_Repository.CatalogUninitialized())
+        throw std::logic_error("Driver settings can seed a profile catalog only while no catalog files exist; repair or restore the repository first");
+    HidHide::Profiles::EnforcementResult result;
+    if (m_Conflict) result = m_Enforcement.AdoptCurrentAsBaseline();
+    else
+    {
+        // Adoption already cleared the evidence (for example when creating the
+        // catalog failed afterwards); only a conflict-free readback may seed it.
+        result = m_Enforcement.Observe();
+        if (result.conflict) { m_Conflict = true; m_Status = result.failure; throw std::runtime_error("Driver settings need review before a profile catalog can be created"); }
+    }
+    if (!result.success || !result.observedKnown) throw std::runtime_error("Current driver settings could not be adopted");
+    m_Conflict = false; m_Status = L"Current driver settings accepted; the profile catalog is being created from them";
+    return result.observed.allowedApplications;
+}
+
 CProfilesCoordinator::ApplyOutcome CProfilesCoordinator::CompleteAdoptionWithoutSettingsChange(
     std::set<std::filesystem::path> const& observedAllowedApplications)
 {

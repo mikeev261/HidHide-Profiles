@@ -141,7 +141,20 @@ namespace HidHide::Profiles
         {
             WriterLease lease(m_Root); return SettingsVersionLocked();
         }
+        // True only for a root that holds no catalog file at all, as opposed to
+        // an incomplete or corrupt catalog whose files are recovery evidence.
+        bool CatalogUninitialized() const
+        {
+            WriterLease lease(m_Root); return !std::filesystem::exists(m_Root / L"settings.json") && !HasCatalogEvidenceLocked();
+        }
     protected:
+        bool HasCatalogEvidenceLocked() const
+        {
+            std::error_code ec;
+            for (auto const& entry : std::filesystem::directory_iterator(m_Root, ec)) if (entry.is_regular_file() && entry.path().filename() != WriterLeaseFileName) return true;
+            if (ec) throw std::system_error(ec, "Inspect profile repository before initialization");
+            return false;
+        }
         struct IntentItem { std::wstring fileName, tempName, backupName, sha256, oldSha256; bool existed{}, remove{}; };
         struct ParsedIntent { std::wstring transaction; std::vector<IntentItem> items; };
         static bool IsDigest(std::wstring const& value, bool emptyAllowed = false)
@@ -310,10 +323,7 @@ namespace HidHide::Profiles
             }
             if (!std::filesystem::exists(m_Root / L"settings.json"))
             {
-                std::error_code ec; bool hasExistingEvidence{};
-                for (auto const& entry : std::filesystem::directory_iterator(m_Root, ec)) if (entry.is_regular_file() && entry.path().filename() != WriterLeaseFileName) { hasExistingEvidence = true; break; }
-                if (ec) throw std::system_error(ec, "Inspect profile repository before initialization");
-                if (hasExistingEvidence) return UninitializedInspection(L"Profile repository is incomplete: settings.json is missing; existing files were preserved");
+                if (HasCatalogEvidenceLocked()) return UninitializedInspection(L"Profile repository is incomplete: settings.json is missing; existing files were preserved");
                 if (!initialAllowedApplications) return UninitializedInspection(L"Fresh profile repository initialization requires a successful, conflict-free observed Allowed-app list; no catalog was written");
                 Profile profile; profile.id = NewStableId(); profile.revision = 1; profile.name = L"Default"; profile.kind = Kind::Global;
                 Settings settings; settings.revision = 1; settings.selectedGlobalId = profile.id; settings.allowedApplications = std::move(*initialAllowedApplications);
