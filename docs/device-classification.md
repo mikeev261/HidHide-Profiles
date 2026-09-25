@@ -18,6 +18,8 @@ in a group. No additional device probes, network requests or polling are added.
    or does not establish game capability. Model rules precede generic words:
    Audeze Maxwell XBOX is a headset, Stream Deck Pedal a shortcut footswitch,
    Sound Blaster X3 an audio interface, and Cam Link 4K a video capture device.
+   A wheel sold with its pedals ("Racing Wheel and Pedals") is a steering wheel;
+   a separate pedal set remains pedals.
 3. All-known non-game collections establish non-game status; vendor, unavailable,
    malformed and unrecognized collections otherwise remain unknown. Multi-axis
    CAD controllers and arbitrary Game Controls page usages are not assumed to be

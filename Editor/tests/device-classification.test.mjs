@@ -93,3 +93,11 @@ test('combined view filters keep unknowns and preserve hidden, pending and offli
  assert.equal(JSON.stringify(draft),before);assert.equal(dirty(draft),true);
  assert.equal(draft.profile.deviceRules.find(r=>r.identity==='audio').visibility,'hidden');
 });
+
+test('wheel and pedal combination devices are steering wheels, separate pedals stay pedals (#33)',()=>{
+ for(const name of ['Thrustmaster T150 Racing Wheel and Pedals','Logitech Driving Force Wheel & Pedals','Hori Racing Wheel Apex with pedals','Pedals + Steering Wheel Set'])
+  assert.equal(classifyDevice(info(name)).kind,'wheel',name);
+ for(const name of ['Heusinkveld Sim Pedals Sprint','Fanatec ClubSport Pedals V3','Generic USB pedals'])
+  assert.equal(classifyDevice(info(name)).kind,'pedals',name);
+ assert.equal(classifyDevice(info('Gaming mouse wheel')).kind,'mouse');
+});
