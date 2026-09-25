@@ -679,6 +679,8 @@ namespace
                 {
                     auto result = request("{\"command\":\"snapshot\"}"); auto const& snapshot = AsObject(Required(AsObject(result), L"snapshot"));
                     require(!AsArray(Required(snapshot,L"repositoryIssues")).empty() && coordinator.HasRepositoryDiagnostics(), "invalid repository was not blocked");
+                    auto instance = AsString(Required(snapshot,L"engineInstance")); auto again = request("{\"command\":\"snapshot\"}");
+                    require(IsStableId(instance) && AsString(Required(AsObject(Required(AsObject(again), L"snapshot")),L"engineInstance")) == instance, "engine instance identity is missing or unstable");
                     std::string retryRequest="{\"command\":\"retry\"}";
                     auto retryBytes=service.Handle({retryRequest.begin(),retryRequest.end()});
                     auto retry=Parser(FromUtf8(std::string(retryBytes.begin(),retryBytes.end()))).Parse();

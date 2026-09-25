@@ -5,12 +5,12 @@ const {pathToFileURL}=require('node:url');
 const fs=require('node:fs');
 const {createAppIconLoader}=require('./app-icons.cjs');
 const {createAppearanceStore}=require('./appearance.cjs');
+const {createEngineRequests}=require('./engine-requests.cjs');
 const MAX=4*1024*1024;
 const origin='hidhide://editor';
 protocol.registerSchemesAsPrivileged([{scheme:'hidhide',privileges:{standard:true,secure:true,supportFetchAPI:true}}]);
 app.setName('HidHide Profiles');
-let window,dirty=false,closing=false,inFlight=0,registered=false,closeWhenIdle=false,repositoryPath=null;
-let engineStartAttempted=false;
+let window,dirty=false,closing=false,inFlight=0,closeWhenIdle=false,repositoryPath=null;
 const loadAppIcon=createAppIconLoader(app);
 const fixture=!app.isPackaged&&process.argv.includes('--fixture');
 const engineLaunching=process.argv.includes('--engine-launching');
@@ -33,7 +33,7 @@ function exchange(request){
   if(!bridge){
    const child=spawn(native,fixtureNative?['--editor-fixture-session',fixtureNative]:['--editor-session'],{windowsHide:true,stdio:['pipe','pipe','pipe']});
    const state={child,pending:null,buffer:Buffer.alloc(0),error:''};bridge=state;
-   const fail=cause=>{if(bridge!==state)return;bridge=null;registered=false;if(state.pending){clearTimeout(state.pending.timer);state.pending.reject(cause);state.pending=null;}child.kill();};
+   const fail=cause=>{if(bridge!==state)return;bridge=null;requests.unregister();if(state.pending){clearTimeout(state.pending.timer);state.pending.reject(cause);state.pending=null;}child.kill();};
    child.on('error',fail);child.stdin.on('error',fail);
    child.stderr.on('data',data=>{if(state.error.length<8192)state.error+=data.toString('utf8');});
    child.stdout.on('data',data=>{
@@ -51,37 +51,15 @@ function exchange(request){
   }
   const state=bridge;
   if(state.pending){reject(Error('Profile engine request overlap.'));return;}
-  const timer=setTimeout(()=>{if(bridge===state){state.pending=null;stopBridge();registered=false;}reject(Error('The engine did not respond. The outcome may be unknown; reconnect before retrying.'));},15000);
+  const timer=setTimeout(()=>{if(bridge===state){state.pending=null;stopBridge();requests.unregister();}reject(Error('The engine did not respond. The outcome may be unknown; reconnect before retrying.'));},15000);
   state.pending={resolve,reject,timer};
   state.child.stdin.write(JSON.stringify(request)+'\n');
  });
 }
-let requestQueue=Promise.resolve();
-function request(request){
- const next=requestQueue.then(async()=>{
-  if(!request||typeof request!=='object'||!commands.has(request.command)||Buffer.byteLength(JSON.stringify(request))>MAX)throw Error('Invalid editor command.');
-  inFlight++;try{
-   if(fixture)return await require('./fixture.cjs').request(request);
-   let result=await exchange(request);
-   // Direct editor launches can create the resident native owner once. Native
-   // ownership admission still decides whether this ordinary-user process runs.
-   if(request.command==='snapshot'&&!engineStartAttempted&&!fixtureNative&&!engineLaunching){
-    engineStartAttempted=true;
-    if(!result.ok&&fs.existsSync(native)){
-     startEngine();
-     for(let attempt=0;attempt<4&&!result.ok;attempt++){
-      await new Promise(resolve=>setTimeout(resolve,300));
-      result=await exchange(request);
-     }
-    }
-   }
-   if(result.snapshot?.repositoryPath)repositoryPath=result.snapshot.repositoryPath;
-   if(!result.ok){registered=false;return result;}
-   if(!registered){const registration=await exchange({command:'editor-state',pid:process.pid,dirty});if(!registration.ok)throw Error(registration.error);registered=true;}
-   return result;
-  }catch(error){registered=false;throw error;}finally{finishOperation();}
- });requestQueue=next.catch(()=>{});return next;
-}
+const requests=createEngineRequests({commands,exchange,fixtureRequest:fixture?require('./fixture.cjs').request:null,
+ canStartEngine:()=>!fixtureNative&&!engineLaunching,startEngine,pid:process.pid,isDirty:()=>dirty,
+ onSnapshot:snapshot=>{if(snapshot.repositoryPath)repositoryPath=snapshot.repositoryPath;},onStart:()=>{inFlight++;},onFinish:finishOperation});
+const request=value=>requests.request(value);
 const pickers={
  executable:{title:'Choose application',filters:[{name:'Windows application',extensions:['exe']}],properties:['openFile']},
  import:{title:'Import profile as a disabled copy',filters:[{name:'Profile JSON',extensions:['json']}],properties:['openFile']},
@@ -130,6 +108,6 @@ if(!app.requestSingleInstanceLock()){app.quit();}else{
   await window.loadURL(origin+'/index.html');window.show();
  });
 }
-function startEngine(){const child=spawn(native,['--background'],{detached:true,windowsHide:true,stdio:'ignore'});child.on('error',()=>{});child.unref();}
+function startEngine(){if(!fs.existsSync(native))return false;const child=spawn(native,['--background'],{detached:true,windowsHide:true,stdio:'ignore'});child.on('error',()=>{});child.unref();return true;}
 app.on('window-all-closed',()=>app.quit());
 app.on('before-quit',()=>{discovery.cancel();stopBridge();});
