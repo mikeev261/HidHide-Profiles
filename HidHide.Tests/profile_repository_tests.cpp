@@ -782,6 +782,23 @@ TEST(ProfileRepository, CrossProcessWriterLeaseSerializesApplyAndPreservesCas)
     ::CloseHandle(ready); ::CloseHandle(command); ::CloseHandle(completed);
 }
 
+TEST(ProfileRepository, ReadingTheRepositoryDoesNotTriggerItsChangeWatcher)
+{
+    // The coordinator reloads when the repository directory changes (same
+    // filter as RepositoryWatcherMain). Taking the writer lease for a read must
+    // not change it, or every reload triggers the next one and the engine's
+    // GUI thread spins forever.
+    TempDirectory temp; ProfileRepository repository(temp.path); repository.OpenOrCreate();
+    HANDLE changed = ::FindFirstChangeNotificationW(temp.path.c_str(), FALSE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE);
+    ASSERT_NE(INVALID_HANDLE_VALUE, changed);
+    RepositoryView view(temp.path);
+    EXPECT_NO_THROW(view.Load());
+    EXPECT_NO_THROW(view.Inspect());
+    EXPECT_NO_THROW(repository.Version(repository.Load().snapshot.settings.selectedGlobalId));
+    EXPECT_EQ(static_cast<DWORD>(WAIT_TIMEOUT), ::WaitForSingleObject(changed, 500));
+    ::FindCloseChangeNotification(changed);
+}
+
 TEST(ProfileRepository, WriterLeaseCannotBeSquattedThroughAGlobalName)
 {
     // #19: another user could pre-create the predictable Global mutex name,

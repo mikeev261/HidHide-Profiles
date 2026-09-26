@@ -70,11 +70,12 @@ namespace HidHide::Profiles
     }
 
     // Serializes one repository across threads, processes and sessions of the
-    // same user. The lock is an exclusive file inside the user's own repository
-    // directory: unlike a predictable Global object name, other users cannot
-    // create or deny it. It is deleted on release and freed if a holder dies.
+    // same user. The lock is an exclusive "<repository>.writer.lock" file next to
+    // the repository directory, in the user's own profile: unlike a predictable
+    // Global object name, other users cannot create or deny it. It is deleted on
+    // release and freed if a holder dies. It is deliberately outside the
+    // repository directory, whose change notifications trigger reloads.
     // Nested leases on one thread are reentrant, like the mutex this replaces.
-    inline constexpr wchar_t WriterLeaseFileName[]{ L".writer.lock" };
     class WriterLease
     {
         static std::map<std::wstring, std::pair<HANDLE, unsigned>>& Held()
@@ -84,12 +85,13 @@ namespace HidHide::Profiles
         explicit WriterLease(std::filesystem::path const& root)
         {
             auto canonical = std::filesystem::absolute(root).lexically_normal();
+            if (!canonical.has_filename()) canonical = canonical.parent_path();
             m_Key = canonical.native(); std::transform(m_Key.begin(), m_Key.end(), m_Key.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
             auto& held = Held();
             if (auto it = held.find(m_Key); it != held.end()) { ++it->second.second; return; }
             std::error_code ec; std::filesystem::create_directories(canonical, ec);
             if (ec) throw std::system_error(ec, "Create profile repository");
-            auto path = canonical / WriterLeaseFileName; auto deadline = ::GetTickCount64() + 10000;
+            auto path = canonical.parent_path() / (canonical.filename().native() + L".writer.lock"); auto deadline = ::GetTickCount64() + 10000;
             HANDLE file{};
             while ((file = ::CreateFileW(path.c_str(), GENERIC_READ | DELETE, 0, nullptr, OPEN_ALWAYS,
                 FILE_ATTRIBUTE_HIDDEN | FILE_FLAG_DELETE_ON_CLOSE, nullptr)) == INVALID_HANDLE_VALUE)
@@ -254,7 +256,7 @@ namespace HidHide::Profiles
             if (!std::filesystem::exists(m_Root / L"settings.json"))
             {
                 std::error_code ec; bool hasExistingEvidence{};
-                for (auto const& entry : std::filesystem::directory_iterator(m_Root, ec)) if (entry.is_regular_file() && entry.path().filename() != WriterLeaseFileName) { hasExistingEvidence = true; break; }
+                for (auto const& entry : std::filesystem::directory_iterator(m_Root, ec)) if (entry.is_regular_file()) { hasExistingEvidence = true; break; }
                 if (ec) throw std::system_error(ec, "Inspect profile repository before initialization");
                 if (hasExistingEvidence) return UninitializedInspection(L"Profile repository is incomplete: settings.json is missing; existing files were preserved");
                 if (!initialAllowedApplications) return UninitializedInspection(L"Fresh profile repository initialization requires a successful, conflict-free observed Allowed-app list; no catalog was written");
