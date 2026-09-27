@@ -83,12 +83,16 @@ removal. The exact pinned upstream EXE is used only as recovery media, not a cha
 legacy installer or a helper. Build acquisition remains responsible for verifying
 the original Microsoft catalog and payload membership.
 
-`StageAppRuntime.ps1` stages four pinned, signed AMD64 Microsoft runtime DLLs.
+`StageAppRuntime.ps1` stages four signed AMD64 Microsoft runtime DLLs.
 All four are app-local MSI files; the three needed by the CLI accompany the BA.
 Dependency inspection covers normal and delay imports. This follows Microsoft's
 [app-local deployment guidance](https://learn.microsoft.com/en-us/cpp/windows/deployment-in-visual-cpp?view=msvc-170).
-Pins are tied to the installed compiler/runtime set and require release-toolchain
-review. A clean offline machine has not yet exercised this deployment.
+They come from the installed toolset's default redist directory
+(`VC\Auxiliary\Build\Microsoft.VCRedistVersion.default.txt`, overridable with
+`-RedistVersion`), which must not be older than the default compiler toolset.
+Each file must carry a valid Microsoft Authenticode signature and be an AMD64 PE;
+the redist version, file versions and SHA256 hashes are recorded under `vcRuntime`
+in `release-manifest.json` for release-toolchain review. A clean offline machine has not yet exercised this deployment.
 
 The bundle supports `/quiet --inspect-only` for a nonmutating smoke test. It loads
 the actual WiX BA, detects packages and runs the extracted controller's `--inspect`;
