@@ -42,7 +42,7 @@ foreach($name in @('HidHideClient.exe','HidHideCLI.exe')) { Copy-Item -LiteralPa
 if (!(Test-Path -LiteralPath "$Staging\Editor\HidHideProfiles.exe")) { throw 'Missing independently packaged Electron editor. Run unified Ci to stage it.' }
 Copy-Item -LiteralPath "$Staging\Editor" -Destination "$($payload.FullName)\Editor" -Recurse
 $Staging = $payload.FullName
-& "$repo\build\StageAppRuntime.ps1" -Staging $Staging
+$vcRuntime = @(& "$repo\build\StageAppRuntime.ps1" -Staging $Staging)
 foreach($name in @('HidHideClient.exe','HidHideCLI.exe')) { SignFile "$Staging\$name" }
 SignFile "$Staging\Editor\HidHideProfiles.exe"
 Run dotnet @('build',"$repo\Installer",'-c','Release')
@@ -76,6 +76,7 @@ $manifest = [ordered]@{
  buildStartedUtc=$buildStartedUtc; buildFinishedUtc=[DateTime]::UtcNow.ToString('o'); wixVersion=$wixVersion
  applicationInputs=@($applicationInputs); applicationProvenance='Explicit prebuilt inputs; their hashes identify the binaries, not proof of compilation from this source snapshot.'
  artifactKind='Windows Installer package'; publicMsi=$true
+ vcRuntime=$vcRuntime
  driver=$driverManifest
  files=@(Get-ChildItem -LiteralPath $Out -File -Recurse | ForEach-Object { @{ path=$_.FullName.Substring($Out.Length+1); sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash } })
 }
