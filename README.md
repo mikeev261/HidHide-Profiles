@@ -2,6 +2,11 @@
 
 One Windows 11 x64 setup for profile-based HidHide configuration, its resident profile coordinator, CLI, and the unchanged Microsoft-signed upstream driver. The unified package is undergoing release validation; see [current status](docs/unified-package-progress.md), [installation layout](INSTALL_LAYOUT.md), and [build instructions](BUILD_AND_RELEASE.md).
 
+<picture>
+  <source media="(prefers-color-scheme: light)" srcset="docs/images/editor-application-profile-light.png">
+  <img src="docs/images/editor-application-profile.png" alt="HidHide Profiles editor showing the Le Mans Ultimate application profile, with the steering wheel and pedals hidden from other games">
+</picture>
+
 ## Introduction
 
 *Microsoft Windows* offers support for a wide range of human interface devices, like joysticks and game pads.
@@ -36,6 +41,35 @@ multiple notifications while binding game functions and device controls.
 The public MSI contains `HidHideClient.exe`, `HidHideCLI.exe`, app-local runtimes and the verified driver package under `%ProgramFiles%\HidHide\`. Standard Windows Installer dialogs manage installation, repair and removal and present one Installed Apps entry. Start the MSI normally and approve elevation when requested; the configuration utility runs without elevated rights. Existing companion-only instructions are superseded.
 
 ## User guide
+
+### How profiles work
+
+A profile says which devices are hidden. There are two kinds:
+
+- **Global** profiles apply when no application profile is running. A fresh install creates an all-Visible *Default*.
+  The **Applied now** column shows what the driver is doing at the moment, so here it reports the wheel and pedals as
+  Hidden, because a running application profile is in charge.
+
+  ![The Default Global profile: every device Visible in the profile, while Applied now shows the running application profile's hiding](docs/images/editor-global-profile.png)
+
+- **Application** profiles are tied to one exact executable. While that game runs, its rules replace the Global
+  profile. When it exits, the previous mask comes back. The card at the top shows the matched executable and offers
+  **Launch with profile**, which applies and verifies hiding *before* the game starts.
+
+Create an application profile with the **+** button. Browse for the game's executable or pick it from the
+applications that are running now:
+
+![New profile dialog listing running applications to base a profile on](docs/images/editor-new-profile.png)
+
+Edits are drafts until you **Apply changes**. The dot beside a row and the pending-change bar show what will change,
+and **Applied now** keeps showing the driver's real state until the edit is saved and applied:
+
+![A pending edit hiding the Xbox gamepad, not yet applied](docs/images/editor-pending-change.png)
+
+The view filters (**Hide disconnected**, **Hide non-game controllers**) only shorten the list; they never change
+profile rules. The details of activation order, pinning and launching follow.
+
+### Reference
 
 Profiles are the configuration utility's main workspace. Each saved profile is a complete visibility
 policy: devices default to Visible, and exact device identities can be marked Hidden
