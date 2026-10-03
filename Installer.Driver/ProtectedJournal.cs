@@ -81,7 +81,7 @@ public sealed class ProtectedJournal : ITransactionJournal
     }
     public static void Validate(TransactionRecord record)
     {
-        if (record.Schema != 1 || record.Id == Guid.Empty || record.PayloadIdentity != Payload.InfHash ||
+        if (record.Schema is not (1 or 2) || record.Id == Guid.Empty || record.PayloadIdentity != Payload.InfHash ||
             !Enum.IsDefined(typeof(Operation), record.Operation) || !Enum.IsDefined(typeof(JournalStatus), record.Status) ||
             record.Steps == null || record.Steps.Count > 32 || record.Failure == null || record.Failure.Length > 256)
             throw new InvalidDataException("Unsupported maintenance journal.");
@@ -103,7 +103,21 @@ public sealed class ProtectedJournal : ITransactionJournal
                 throw new InvalidDataException("Invalid journal device identity.");
             if (node.Inf != "") Payload.PublishedInf(node.Inf);
         }
+        // Empty identity is an initialization allowance, never completed work
+        // or a restart checkpoint that may clear protected exclusion.
+        if (record.Schema == 2 && string.IsNullOrEmpty(record.BootId) &&
+            (record.Steps.Count != 0 || record.Status is not (JournalStatus.Prepared or JournalStatus.Committed)))
+            throw new InvalidDataException("Missing recorded boot evidence for driver work.");
+        // Schema 1 predates these members; schema 2 must explicitly persist them.
+        // Preparation identity is never proof of the boot that performed work.
+        if (record.Schema == 2 && (!record.HasCommitRebootEvidence || record.RestartAnchor == null ||
+            string.IsNullOrEmpty(record.RestartAnchor) &&
+            (record.Steps.Count != 0 || record.Status is not (JournalStatus.Prepared or JournalStatus.Committed))))
+            throw new InvalidDataException("Missing schema-2 restart obligation or actual-work anchor.");
         if (!string.IsNullOrEmpty(record.BootId) && !BootIdentity.Valid(record.BootId)) throw new InvalidDataException("Invalid boot identity.");
+        if (!string.IsNullOrEmpty(record.RestartAnchor) && !BootIdentity.Stable(record.RestartAnchor)) throw new InvalidDataException("Invalid restart anchor.");
+        if (record.Schema == 1 && (!string.IsNullOrEmpty(record.RestartAnchor) || record.CommitRebootRequired || BootIdentity.Stable(record.BootId)))
+            throw new InvalidDataException("Stable restart evidence requires journal schema 2.");
         if (record.Before.ControlAvailable && record.Before.Settings == null) throw new InvalidDataException("Missing confirmed driver settings backup.");
         if (record.Before.Settings != null)
             SettingsCodec.Validate(record.Before.Settings);

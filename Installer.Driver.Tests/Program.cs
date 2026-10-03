@@ -5,7 +5,229 @@ using Microsoft.Win32;
 int checks = 0;
 void Check(bool value, string name) { if (!value) throw new Exception(name); checks++; }
 void Reject(Action action, string name) { bool threw = false; try { action(); } catch { threw = true; } Check(threw, name); }
-TransactionRecord Record(Fake backend, Operation operation) => new() { Id = Guid.NewGuid(), InitiatingSid = "S-1-5-21-1-2-3-1001", Operation = operation, BootId = "1", Before = backend.Inspect() };
+TransactionRecord Record(Fake backend, Operation operation) => new() { Id = Guid.NewGuid(), InitiatingSid = "S-1-5-21-1-2-3-1001", Operation = operation, BootId = "winboot-v1:1", Before = backend.Inspect() };
+
+// Read-only provider smoke is opt-in and never opens the driver or journals.
+if (args.Contains("--boot-identity-smoke"))
+{
+    string boot = BootIdentity.Current();
+    Check(BootIdentity.Stable(boot), "production provider returns canonical stable identity");
+    for (int i = 0; i < 100; i++) Check(BootIdentity.Current() == boot, "same live boot has stable identity");
+    Console.WriteLine("Read-only current boot identity: " + boot); return;
+}
+
+// Witness the original predicate's false-positive and false-negative. These
+// are synthetic clock corrections; the host clock is never changed.
+string savedTimestamp = "638900000000000000", correctedTimestamp = "638899999000000000";
+Check(BootIdentity.Legacy(savedTimestamp) && BootIdentity.Legacy(correctedTimestamp) && savedTimestamp != correctedTimestamp,
+    "old timestamp inequality falsely permits same-boot clock correction");
+Check(!BootIdentity.Changed("winboot-v1:1", "winboot-v1:1"), "clock/timezone changes and hibernation with retained kernel identity cannot advance");
+Check(BootIdentity.Changed("winboot-v1:1", "winboot-v1:2"), "new kernel identity advances even with identical synthetic wall time");
+Check(BootIdentity.Changed("winboot-v1:4294967295", "winboot-v1:0"), "uint wrap remains a changed boot");
+foreach (string invalidBoot in new[] { "", "winboot-v1:01", "winboot-v1:-1", "winboot-v1:4294967296", "winboot-v2:1", "1 ", "01" })
+{
+    Check(!BootIdentity.Valid(invalidBoot), "malformed identity rejected: " + invalidBoot);
+    Check(!BootIdentity.Changed("winboot-v1:1", invalidBoot), "malformed provider cannot prove restart");
+}
+foreach (bool rollback in new[] { false, true })
+{
+    var b = new Fake(); var r = Record(b, Operation.Install); var j = new SnapshotJournal();
+    var t = new DriverTransaction(b, j, r); t.Apply("winboot-v1:1"); if (rollback) t.Rollback("winboot-v1:1");
+    r.Schema = 1; r.BootId = savedTimestamp; r.RestartAnchor = ""; j.Save(r);
+    byte[] steps = ProtectedJournal.StateBytes(b.Inspect()); int nativeCalls = b.Calls.Count;
+    Check(t.ResumeAfterReboot("winboot-v1:9") == (rollback ? JournalStatus.RollbackRebootRequired : JournalStatus.RebootRequired), "legacy checkpoint anchors without claiming reboot");
+    Check(r.Schema == 2 && r.BootId == savedTimestamp && r.RestartAnchor == "winboot-v1:9" && r.Reboot && b.Calls.Count == nativeCalls,
+        "legacy evidence and exclusion retained without native work");
+    r = j.Load(); t = new DriverTransaction(b, j, r);
+    Reject(() => t.ResumeAfterReboot("winboot-v1:9"), "reloaded migration refuses same boot");
+    Reject(() => t.ResumeAfterReboot(correctedTimestamp), "clock-corrected legacy provider refuses advancement");
+    Check(b.Calls.Count == nativeCalls && ProtectedJournal.StateBytes(b.Inspect()).SequenceEqual(steps), "rejected reboot does not mutate backend");
+    Check(t.ResumeAfterReboot("winboot-v1:10") != JournalStatus.RecoveryRequired, "next stable boot can continue existing prefix");
+}
+{
+    var b = Fake.Healthy(); var r = Record(b, Operation.Repair); var j = new SnapshotJournal(); var t = new DriverTransaction(b, j, r);
+    t.Apply("winboot-v1:1"); r.CommitRebootRequired = true; j.Save(r);
+    Reject(() => t.VerifyCommitRestart("winboot-v1:1"), "MSI-only forced restart cannot commit in same boot");
+    Reject(() => t.VerifyCommitRestart(correctedTimestamp), "legacy clock correction cannot authorize MSI commit");
+    Check(t.VerifyCommitRestart("winboot-v1:2"), "MSI-only forced restart verifies changed stable boot");
+    r.Schema = 1; r.CommitRebootRequired = false; r.BootId = savedTimestamp; r.RestartAnchor = ""; j.Save(r);
+    Check(!t.VerifyCommitRestart("winboot-v1:5"), "legacy Applied commit anchors and demands another restart");
+    r = j.Load(); t = new DriverTransaction(b, j, r);
+    Check(r.BootId == savedTimestamp && r.CommitRebootRequired, "legacy commit recovery preserves original timestamp and durable restart requirement");
+    Reject(() => t.VerifyCommitRestart("winboot-v1:5"), "legacy commit retry refuses same anchor");
+    Check(t.VerifyCommitRestart("winboot-v1:6") && b.Calls.Count == 0, "legacy commit gate authorizes only next stable boot without native writes");
+}
+{
+    var b = new Fake { RebootAt = "bind" }; var r = Record(b, Operation.Install); var j = new MemoryJournal(); var t = new DriverTransaction(b, j, r);
+    t.Apply("winboot-v1:7");
+    Reject(() => t.ResumeAfterReboot("winboot-v1:7"), "recovered Prepared apply cannot reuse an older preparation boot as restart proof");
+    Check(t.ResumeAfterReboot("winboot-v1:8") == JournalStatus.RebootRequired, "recovered Prepared work continues on actual next boot");
+}
+{
+    var b = Fake.Healthy(); b.State.Filters[0].Entries = new[] { "VendorA", "VendorB" };
+    var r = Record(b, Operation.Repair); var j = new SnapshotJournal(); var t = new DriverTransaction(b, j, r);
+    t.Apply("winboot-v1:1"); t.ResumeAfterReboot("winboot-v1:2"); t.Rollback("winboot-v1:7");
+    Reject(() => t.ResumeAfterReboot("winboot-v1:7"), "new rollback restart cannot reuse earlier forward boot");
+    Check(t.ResumeAfterReboot("winboot-v1:8") == JournalStatus.RolledBack, "rollback uses actual new-work boot anchor");
+}
+foreach (JournalStatus rejectedStatus in new[] { JournalStatus.Applying, JournalStatus.RecoveryRequired, JournalStatus.Committed })
+{
+    var b = new Fake(); var r = Record(b, Operation.Install); r.Status = rejectedStatus;
+    var j = new MemoryJournal(); var t = new DriverTransaction(b, j, r);
+    Reject(() => t.Apply("winboot-v1:99"), "rejected apply cannot rewrite anchor: " + rejectedStatus);
+    Check(r.RestartAnchor == "" && j.Writes == 0 && b.Calls.Count == 0, "rejected apply retains all recovery evidence");
+}
+{
+    var r = Record(new Fake(), Operation.Install); r.Schema = 1;
+    Reject(() => ProtectedJournal.Validate(r), "schema1 cannot carry stable identities ignored by old readers");
+    r.BootId = savedTimestamp; ProtectedJournal.Validate(r);
+    r.RestartAnchor = "winboot-v1:1";
+    Reject(() => ProtectedJournal.Validate(r), "schema1 cannot carry a restart anchor ignored by old readers");
+    r.RestartAnchor = ""; r.CommitRebootRequired = true;
+    Reject(() => ProtectedJournal.Validate(r), "schema1 cannot carry commit restart requirement ignored by old readers");
+}
+
+// Persist original MSI intent, interrupt before dispatch, reload on another boot,
+// then interrupt after Applied: neither interruption may erase the obligation.
+foreach (var op in new[] { Operation.Repair, Operation.Upgrade })
+{
+    var b = Fake.Healthy(); var r = Record(b, op); var j = new SnapshotJournal();
+    new DriverTransaction(b, j, r).PrepareMsiApply();
+    r = j.Load();
+    Check(r.Status == JournalStatus.Prepared && r.CommitRebootRequired == (op != Operation.Upgrade), "pre-dispatch serialized MSI obligation: " + op);
+    var t = new DriverTransaction(b, j, r);
+    t.PrepareMsiApply(); // recovered Prepared preserves the original obligation
+    Check(t.Apply("winboot-v1:7") == JournalStatus.Applied, "healthy worker reaches Applied: " + op);
+    r = j.Load(); t = new DriverTransaction(b, j, r);
+    Check(r.RestartAnchor == "winboot-v1:7" && b.Calls.Count == 0, "actual work boot anchored without native writes: " + op);
+    if (op == Operation.Repair)
+        Reject(() => t.VerifyCommitRestart("winboot-v1:7"), "interrupted parent cannot bypass same-boot repair commit");
+    else
+        Check(t.VerifyCommitRestart("winboot-v1:7"), "application-only upgrade retains no forced restart");
+    Check(t.VerifyCommitRestart("winboot-v1:8"), "serialized Applied obligation accepts next actual boot: " + op);
+}
+foreach (string missing in new[] { "", "winboot-v1:01", "garbage" })
+{
+    var b = Fake.Healthy(); var r = Record(b, Operation.Upgrade); r.Status = JournalStatus.Applied; r.BootId = missing;
+    var j = new MemoryJournal();
+    Reject(() => new DriverTransaction(b, j, r).VerifyCommitRestart("winboot-v1:7"), "missing/malformed saved evidence cannot commit: " + missing);
+    Check(j.Writes == 0 && b.Calls.Count == 0, "invalid commit evidence preserved without writes");
+}
+{
+    var b = Fake.Healthy(); var r = Record(b, Operation.Repair); r.BootId = "";
+    ProtectedJournal.Validate(r); var j = new SnapshotJournal(); var t = new DriverTransaction(b, j, r);
+    t.PrepareMsiApply(); t.Apply("winboot-v1:7");
+    Check(j.Load().BootId == "winboot-v1:7", "legitimate empty Prepared initialization obtains actual work evidence");
+}
+
+// Exercise the production XML format, not initialized in-memory defaults.
+TransactionRecord Serialized(TransactionRecord source, string member = "", string edit = "")
+{
+    var serializer = new System.Runtime.Serialization.DataContractSerializer(typeof(TransactionRecord));
+    using var bytes = new MemoryStream(); serializer.WriteObject(bytes, source);
+    var xml = new System.Xml.XmlDocument(); xml.LoadXml(System.Text.Encoding.UTF8.GetString(bytes.ToArray()));
+    foreach (string name in member.Split(',').Where(x => x != ""))
+    {
+        var element = (System.Xml.XmlElement)xml.DocumentElement!.ChildNodes.Cast<System.Xml.XmlNode>().Single(x => x.LocalName == name);
+        if (edit == "omit") element.ParentNode!.RemoveChild(element);
+        else { element.InnerText = ""; if (edit == "nil") element.SetAttribute("nil", "http://www.w3.org/2001/XMLSchema-instance", "true"); }
+    }
+    using var reader = new System.Xml.XmlNodeReader(xml);
+    return (TransactionRecord)serializer.ReadObject(reader)!;
+}
+foreach (string gate in new[] { "forward", "inverse", "commit", "upgrade" })
+{
+    var b = gate is "commit" or "upgrade" ? Fake.Healthy() : new Fake { RebootAt = "bind" };
+    var r = Record(b, gate == "upgrade" ? Operation.Upgrade : gate == "commit" ? Operation.Repair : Operation.Install);
+    var j = new SnapshotJournal(); var t = new DriverTransaction(b, j, r); t.PrepareMsiApply(); t.Apply("winboot-v1:7");
+    if (gate == "inverse") t.Rollback("winboot-v1:7");
+    var normal = Serialized(r); ProtectedJournal.Validate(normal);
+    Check(normal.RestartAnchor == "winboot-v1:7" && normal.CommitRebootRequired == (gate != "upgrade"), "serialized true/false evidence preserved: " + gate);
+    foreach (string member in new[] { "CommitRebootRequired", "RestartAnchor" })
+    foreach (string edit in new[] { "omit", "empty", "nil" })
+    {
+        int calls = b.Calls.Count;
+        Reject(() => {
+            var broken = Serialized(r, member, edit); ProtectedJournal.Validate(broken);
+            var engine = new DriverTransaction(b, j, broken);
+            if (gate is "commit" or "upgrade") engine.VerifyCommitRestart("winboot-v1:7");
+            else engine.ResumeAfterReboot("winboot-v1:7");
+        }, "serialized incomplete evidence refuses " + gate + "/" + member + "/" + edit);
+        Check(b.Calls.Count == calls && j.Load().Status == r.Status && j.Load().RestartAnchor == "winboot-v1:7",
+            "incomplete evidence retains native prefix and durable checkpoint");
+    }
+}
+{
+    var r = Record(new Fake(), Operation.Install); var untouched = Serialized(r); ProtectedJournal.Validate(untouched);
+    Check(untouched.Status == JournalStatus.Prepared && untouched.RestartAnchor == "" && !untouched.CommitRebootRequired, "explicit no-work schema2 preparation roundtrips");
+    r.Schema = 1; r.BootId = savedTimestamp;
+    var oldXml = Serialized(r, "CommitRebootRequired,RestartAnchor", "omit");
+    ProtectedJournal.Validate(oldXml);
+    Check(oldXml.Schema == 1 && oldXml.BootId == savedTimestamp, "real schema1 XML omissions remain readable");
+    var preparedJournal = new SnapshotJournal(); var preparedBackend = new Fake(); var preparedEngine = new DriverTransaction(preparedBackend, preparedJournal, oldXml);
+    preparedEngine.PrepareMsiApply(); preparedEngine.Apply("winboot-v1:7");
+    Check(preparedJournal.Load().RestartAnchor == "winboot-v1:7" && preparedJournal.Load().CommitRebootRequired, "legacy omitted Prepared evidence gains current-work anchor and durable obligation");
+    var b = Fake.Healthy(); var applied = Record(b, Operation.Repair); applied.Schema = 1; applied.BootId = savedTimestamp; applied.Status = JournalStatus.Applied;
+    var loaded = Serialized(applied, "CommitRebootRequired,RestartAnchor", "omit"); var j = new SnapshotJournal();
+    Check(!new DriverTransaction(b, j, loaded).VerifyCommitRestart("winboot-v1:7"), "omitted schema1 members migrate with another restart");
+    var migrated = j.Load(); ProtectedJournal.Validate(migrated);
+    Reject(() => new DriverTransaction(b, j, migrated).VerifyCommitRestart("winboot-v1:7"), "serialized legacy migration refuses same boot");
+    Check(new DriverTransaction(b, j, migrated).VerifyCommitRestart("winboot-v1:8") && b.Calls.Count == 0, "serialized legacy migration permits next boot without native work");
+}
+
+// Acquisition deliberately lets a preceding owner advance the serialized
+// production journal before handing ownership to the queued caller.
+{
+    var b = new Fake(); var r = Record(b, Operation.Install); var j = new SnapshotJournal(); j.Save(r);
+    var queuedSnapshot = j.Load(); bool held = false; int releases = 0;
+    using (var owned = new OwnedJournal<FixtureLease>(
+        () => {
+            var worker = new DriverTransaction(b, j, j.Load());
+            worker.PrepareMsiApply(); worker.Apply("winboot-v1:7");
+            held = true; return new FixtureLease(() => { held = false; releases++; });
+        }, () => { Check(held, "journal reload occurs after maintenance acquisition"); return j.Load(); }))
+    {
+        Check(queuedSnapshot.Status == JournalStatus.Prepared && owned.Record.Status == JournalStatus.RebootRequired,
+            "queued MSI parent observes worker advancement rather than stale Prepared");
+        Reject(() => DriverTransaction.PrepareMsiApply(j, owned.Record), "advanced prefix cannot be overwritten by MSI preparation");
+        Check(held, "rejected preparation retains ownership until scope exit");
+    }
+    var durable = j.Load();
+    Check(!held && releases == 1, "ownership released before child dispatch");
+    Check(durable.Status == JournalStatus.RebootRequired && durable.Steps.Count == 6 && durable.Steps.All(x => x.Completed) &&
+        durable.Reboot && durable.RestartAnchor == "winboot-v1:7" && durable.CommitRebootRequired && b.Inspect().Healthy,
+        "interleaving preserves completed native prefix and both restart obligations");
+}
+foreach (string phase in new[] { "worker", "finalization", "rollback" })
+{
+    var b = Fake.Healthy(); var r = Record(b, Operation.Repair); var j = new SnapshotJournal();
+    new DriverTransaction(b, j, r).Apply("winboot-v1:7"); j.Save(r);
+    bool held = false; int releases = 0; int reads = 0;
+    Reject(() => {
+        using var owned = new OwnedJournal<FixtureLease>(
+            () => {
+                var previous = j.Load(); previous.Status = JournalStatus.Committed; previous.Reboot = false; j.Save(previous);
+                held = true; return new FixtureLease(() => { held = false; releases++; });
+            }, () => { reads++; Check(held, "terminal reload under ownership: " + phase); return j.Load(); });
+
+    }, "waiting caller refuses terminal transaction: " + phase);
+    Check(!held && releases == 1 && reads == 1 && j.Load().Status == JournalStatus.Committed && b.Calls.Count == 0,
+        "terminal refusal releases ownership without native/journal mutation: " + phase);
+}
+{
+    var b = Fake.Healthy(); var r = Record(b, Operation.Repair); var j = new SnapshotJournal();
+    new DriverTransaction(b, j, r).Apply("winboot-v1:1"); r.Schema = 1; r.BootId = savedTimestamp; r.RestartAnchor = ""; j.Save(r);
+    using var owned = new OwnedJournal<FixtureLease>(
+        () => {
+            var previous = new DriverTransaction(b, j, j.Load());
+            Check(!previous.VerifyCommitRestart("winboot-v1:5"), "preceding owner establishes legacy commit anchor");
+            return new FixtureLease(() => { });
+        }, j.Load);
+    Reject(() => new DriverTransaction(b, j, owned.Record).VerifyCommitRestart("winboot-v1:5"),
+        "queued finalizer preserves preceding legacy restart anchor");
+    Check(j.Load().RestartAnchor == "winboot-v1:5" && j.Load().CommitRebootRequired && b.Calls.Count == 0,
+        "queued finalizer does not erase or move legacy evidence");
+}
 
 var fresh = new Fake(); var journal = new MemoryJournal(); var record = Record(fresh, Operation.Install);
 var deleting = Fake.Healthy(); deleting.State.ServicePendingDeletion = true;
@@ -15,26 +237,26 @@ Check(!new DriverState { BinaryHash = "unknown" }.CanInstall, "Unknown orphan SY
 Check(!new DriverState { BinaryHash = Payload.SysHash, ServiceExists = true }.CanInstall, "Registered service is not a fresh installation");
 Check(!new DriverState { BinaryHash = Payload.SysHash }.Empty, "Uninstall still requires removal of SYS");
 var leftover = new Fake(); leftover.State.BinaryHash = Payload.SysHash;
-Check(new DriverTransaction(leftover, new MemoryJournal(), Record(leftover, Operation.Install)).Apply() == JournalStatus.RebootRequired, "Install over exact inert upstream file");
+Check(new DriverTransaction(leftover, new MemoryJournal(), Record(leftover, Operation.Install)).Apply("winboot-v1:1") == JournalStatus.RebootRequired, "Install over exact inert upstream file");
 var transaction = new DriverTransaction(fresh, journal, record);
-Check(transaction.Apply() == JournalStatus.RebootRequired, "Filter attachment must request reboot");
+Check(transaction.Apply("winboot-v1:1") == JournalStatus.RebootRequired, "Filter attachment must request reboot");
 Check(fresh.State.Healthy, "Fresh state verifies root, binding, service, filters and control");
 Check(fresh.Calls.SequenceEqual(new[] { "stage", "create", "bind", "filter0", "filter1", "filter2" }), "Install ordering");
 Check(record.Steps.All(x => x.Completed), "Completed operations journaled");
 Check(journal.Writes > fresh.Calls.Count * 2, "Intent and completion are separate durable writes");
-Reject(() => transaction.Apply(), "No replay after reboot result");
-Check(transaction.Rollback() == JournalStatus.RollbackRebootRequired && fresh.Calls.Count == 6, "Rollback direction recorded without crossing reboot boundary");
+Reject(() => transaction.Apply("winboot-v1:1"), "No replay after reboot result");
+Check(transaction.Rollback("winboot-v1:1") == JournalStatus.RollbackRebootRequired && fresh.Calls.Count == 6, "Rollback direction recorded without crossing reboot boundary");
 Check(record.Before.Empty, "Initial snapshot not mutated by execution");
 
 foreach (var operation in new[] { Operation.Repair, Operation.Upgrade }) {
  var backend = Fake.Healthy(); var saved = Record(backend, operation);
- Check(new DriverTransaction(backend, new MemoryJournal(), saved).Apply() == JournalStatus.Applied, "Healthy driver retained");
+ Check(new DriverTransaction(backend, new MemoryJournal(), saved).Apply("winboot-v1:1") == JournalStatus.Applied, "Healthy driver retained");
  Check(backend.Calls.Count == 0, "Repair/upgrade do not reinstall or reset settings");
  Check(!saved.Reboot, "Healthy retained driver does not invent a reboot during repair/upgrade");
 }
 var repairFilters = Fake.Healthy(); repairFilters.State.Filters[1].Entries = new[] { "VendorA", "VendorB" };
 var repairRecord = Record(repairFilters, Operation.Repair);
-Check(new DriverTransaction(repairFilters, new MemoryJournal(), repairRecord).Apply() == JournalStatus.RebootRequired, "Missing filter repair requests reboot");
+Check(new DriverTransaction(repairFilters, new MemoryJournal(), repairRecord).Apply("winboot-v1:1") == JournalStatus.RebootRequired, "Missing filter repair requests reboot");
 Check(repairFilters.Calls.SequenceEqual(new[] { "filter1" }), "Filter repair does not rebind driver or reset baseline");
 Check(repairFilters.State.Settings!.Active, "Filter repair preserves active baseline");
 foreach (string missing in new[] { "node", "package", "service", "binary", "control" })
@@ -46,15 +268,15 @@ foreach (string missing in new[] { "node", "package", "service", "binary", "cont
     if (missing == "service") backend.State.ServiceExists = false;
     if (missing == "binary") backend.State.BinaryHash = "";
     if (missing == "control") { backend.State.ControlAvailable = false; backend.State.Nodes[0].Problem = 10; }
-    var saved = Record(backend, Operation.Repair); saved.BootId = "1";
+    var saved = Record(backend, Operation.Repair); saved.BootId = "winboot-v1:1";
     var engine = new DriverTransaction(backend, new MemoryJournal(), saved);
-    Check(engine.Apply() == JournalStatus.RebootRequired, "reconstruct missing " + missing);
+    Check(engine.Apply("winboot-v1:1") == JournalStatus.RebootRequired, "reconstruct missing " + missing);
     Check(!backend.Calls.Any(x => x.StartsWith("remove")), "repair never tears down " + missing);
     Check(backend.Calls.Count(x => x == "stage") == (missing == "package" ? 1 : 0) && backend.Calls.Count(x => x == "create") == (missing == "node" ? 1 : 0), "repair creates only missing resource " + missing);
-    Reject(() => engine.Rollback(), "repair reboot cannot be destructively reversed " + missing);
-    Check(engine.ResumeAfterReboot("2") == JournalStatus.Applied, "repair verifies retained/new identities after reboot " + missing);
+    Reject(() => engine.Rollback("winboot-v1:1"), "repair reboot cannot be destructively reversed " + missing);
+    Check(engine.ResumeAfterReboot("winboot-v1:2") == JournalStatus.Applied, "repair verifies retained/new identities after reboot " + missing);
     Check(saved.Before.Settings!.Active && backend.State.Settings!.Same(DriverTransaction.ExpectedAfterBinding(saved.Before.Settings)), "repair preserves baseline and verifies expected INF reset " + missing);
-    Reject(() => engine.Rollback(), "completed repair is not rolled back by deleting repaired driver " + missing);
+    Reject(() => engine.Rollback("winboot-v1:1"), "completed repair is not rolled back by deleting repaired driver " + missing);
 }
 {
     var values = new Dictionary<string, (RegistryValueKind? Kind, object? Value)> {
@@ -62,13 +284,13 @@ foreach (string missing in new[] { "node", "package", "service", "binary", "cont
     DriverSettings ReadStored() => StoredDriverSettings.Read(name => values.TryGetValue(name, out var value) ? value : (null, null));
     var stored = ReadStored();
     Check(stored.Active && !stored.Inverse && SettingsCodec.Decode(stored.Whitelist).Single() == "feeder", "stored baseline uses pinned-driver defaults for absent inverse only");
-    values["Active"] = (RegistryValueKind.String, "1"); Reject(() => ReadStored(), "stored flag type rejected");
+    values["Active"] = (RegistryValueKind.String, "winboot-v1:1"); Reject(() => ReadStored(), "stored flag type rejected");
     values["Active"] = (RegistryValueKind.DWord, 2); Reject(() => ReadStored(), "stored flag value rejected");
     values["Active"] = (RegistryValueKind.DWord, 1); values["WhitelistedFullImageNames"] = (RegistryValueKind.MultiString, new[] { "same", "same" }); Reject(() => ReadStored(), "stored duplicate list rejected");
     values.Remove("BlacklistedDeviceInstancePaths"); Reject(() => ReadStored(), "missing stored baseline list rejected");
 }
 var uninstall = Fake.Healthy(); var removal = Record(uninstall, Operation.Uninstall);
-Check(new DriverTransaction(uninstall, new MemoryJournal(), removal).Apply() == JournalStatus.RebootRequired, "Uninstall filter changes report reboot");
+Check(new DriverTransaction(uninstall, new MemoryJournal(), removal).Apply("winboot-v1:1") == JournalStatus.RebootRequired, "Uninstall filter changes report reboot");
 Check(uninstall.Calls.SequenceEqual(new[] { "filter0", "filter1", "filter2", "remove-node", "remove-package" }), "Detach before deletion");
 Check(uninstall.State.Empty, "Uninstall resources removed");
 Check(removal.Before.Settings!.Active, "Original baseline preserved in journal");
@@ -77,31 +299,31 @@ Check(uninstall.State.Filters.All(x => x.Entries.SequenceEqual(new[] { "VendorA"
 foreach (var failure in new[] { "stage", "create", "bind", "filter0", "filter1", "filter2" }) {
  var backend = new Fake { Fail = failure }; var saved = Record(backend, Operation.Install);
  var engine = new DriverTransaction(backend, new MemoryJournal(), saved);
- Reject(() => engine.Apply(), "Failure propagated: " + failure);
+ Reject(() => engine.Apply("winboot-v1:1"), "Failure propagated: " + failure);
  Check(saved.Status == JournalStatus.RecoveryRequired, "Failure retains recovery state");
  Check(!saved.Steps.Last().Completed, "Unknown outcome recorded as intent only");
- Reject(() => engine.Apply(), "Unknown step never replayed");
- Reject(() => engine.Rollback(), "Unknown ownership never guessed");
+ Reject(() => engine.Apply("winboot-v1:1"), "Unknown step never replayed");
+ Reject(() => engine.Rollback("winboot-v1:1"), "Unknown ownership never guessed");
 }
 var detachFailure = Fake.Healthy(); detachFailure.Fail = "filter1";
 var detachRecord = Record(detachFailure, Operation.Uninstall);
-Reject(() => new DriverTransaction(detachFailure, new MemoryJournal(), detachRecord).Apply(), "Detach failure propagates");
+Reject(() => new DriverTransaction(detachFailure, new MemoryJournal(), detachRecord).Apply("winboot-v1:1"), "Detach failure propagates");
 Check(!detachFailure.Calls.Contains("remove-node") && !detachFailure.Calls.Contains("remove-package"), "Detach failure blocks deletion");
 
 foreach (var stop in new[] { "bind", "remove-node", "remove-package" }) {
  var backend = stop == "bind" ? new Fake() : Fake.Healthy(); backend.RebootAt = stop;
  var saved = Record(backend, stop == "bind" ? Operation.Install : Operation.Uninstall);
- Check(new DriverTransaction(backend, new MemoryJournal(), saved).Apply() == JournalStatus.RebootRequired, "BOOL reboot retained: " + stop);
+ Check(new DriverTransaction(backend, new MemoryJournal(), saved).Apply("winboot-v1:1") == JournalStatus.RebootRequired, "BOOL reboot retained: " + stop);
  Check(backend.Calls.Last() == stop, "No action after reboot boundary");
 }
 var ambiguous = Fake.Healthy(); ambiguous.State.Nodes = new[] { ambiguous.State.Nodes[0], ambiguous.State.Nodes[0] };
-Reject(() => new DriverTransaction(ambiguous, new MemoryJournal(), Record(ambiguous, Operation.Repair)).Apply(), "Duplicate nodes rejected");
+Reject(() => new DriverTransaction(ambiguous, new MemoryJournal(), Record(ambiguous, Operation.Repair)).Apply("winboot-v1:1"), "Duplicate nodes rejected");
 Check(ambiguous.Calls.Count == 0, "Unknown ownership never mutated");
 var changed = new Fake(); var stale = Record(changed, Operation.Install); changed.State.Filters[0].Entries = new[] { "External" };
-Reject(() => new DriverTransaction(changed, new MemoryJournal(), stale).Apply(), "Changed snapshot rejected");
+Reject(() => new DriverTransaction(changed, new MemoryJournal(), stale).Apply("winboot-v1:1"), "Changed snapshot rejected");
 Check(changed.Calls.Count == 0, "Stale preparation did not mutate");
 var failJournal = new Fake();
-Reject(() => new DriverTransaction(failJournal, new MemoryJournal { FailWrite = 2 }, Record(failJournal, Operation.Install)).Apply(), "Intent write failure rejects action");
+Reject(() => new DriverTransaction(failJournal, new MemoryJournal { FailWrite = 2 }, Record(failJournal, Operation.Install)).Apply("winboot-v1:1"), "Intent write failure rejects action");
 Check(failJournal.Calls.Count == 0, "No mutation before durable intent");
 
 // Known completed creation can be rolled back in reverse order. Unlike a
@@ -111,8 +333,8 @@ string inf = undo.Stage(), node = undo.CreateNode(); undo.Bind();
 undoRecord.Steps.Add(new Step { Kind = StepKind.Stage, Identity = inf, Completed = true });
 undoRecord.Steps.Add(new Step { Kind = StepKind.CreateNode, Identity = node, Completed = true });
 undoRecord.Steps.Add(new Step { Kind = StepKind.Bind, Completed = true });
-undoRecord.Status = JournalStatus.Applying;
-Check(new DriverTransaction(undo, new MemoryJournal(), undoRecord).Rollback() == JournalStatus.RolledBack, "Confirmed resources rolled back");
+undoRecord.Status = JournalStatus.Applying; undoRecord.RestartAnchor = "winboot-v1:1";
+Check(new DriverTransaction(undo, new MemoryJournal(), undoRecord).Rollback("winboot-v1:1") == JournalStatus.RolledBack, "Confirmed resources rolled back");
 Check(undo.State.Empty && undo.Calls.Skip(undo.Calls.Count - 2).SequenceEqual(new[] { "remove-node", "remove-package" }), "Rollback reverses ownership order");
 
 var invalid = Record(new Fake(), Operation.Install); invalid.Schema = 99;
@@ -157,83 +379,83 @@ foreach(var bytes in new[] { new byte[0], new byte[1], new byte[] { 65,0,0,0 }, 
 Reject(() => SettingsCodec.Encode(new[] { "same", "same" }), "Duplicate READY list rejected");
 Check(SettingsCodec.Decode(SettingsCodec.Encode(new[] { "B", "A" })).SequenceEqual(new[] { "A", "B" }), "READY list encoding matches set semantics");
 
-var resumed = new Fake { RebootAt="bind" }; var resumedRecord=Record(resumed, Operation.Install); resumedRecord.BootId="1";
+var resumed = new Fake { RebootAt="bind" }; var resumedRecord=Record(resumed, Operation.Install); resumedRecord.BootId="winboot-v1:1";
 var resumedEngine=new DriverTransaction(resumed, new MemoryJournal(), resumedRecord);
-Check(resumedEngine.Apply() == JournalStatus.RebootRequired, "Bind reboot checkpoint");
-Reject(() => resumedEngine.ResumeAfterReboot("1"), "Same-boot resume rejected");
+Check(resumedEngine.Apply("winboot-v1:1") == JournalStatus.RebootRequired, "Bind reboot checkpoint");
+Reject(() => resumedEngine.ResumeAfterReboot("winboot-v1:1"), "Same-boot resume rejected");
 resumed.State.Settings!.Active=false;
-Check(resumedEngine.ResumeAfterReboot("2") == JournalStatus.RebootRequired, "Post-bind boot attaches filters and requests stack restart");
+Check(resumedEngine.ResumeAfterReboot("winboot-v1:2") == JournalStatus.RebootRequired, "Post-bind boot attaches filters and requests stack restart");
 Check(resumed.Calls.Count(x=>x=="stage")==1 && resumed.Calls.Count(x=>x=="create")==1 && resumed.Calls.Count(x=>x=="bind")==1, "Resume never repeats completed driver steps");
-Check(resumedEngine.ResumeAfterReboot("3") == JournalStatus.Applied, "Second boot verifies completed installation");
-Reject(() => resumedEngine.ResumeAfterReboot("4"), "Applied transaction cannot replay resume");
+Check(resumedEngine.ResumeAfterReboot("winboot-v1:3") == JournalStatus.Applied, "Second boot verifies completed installation");
+Reject(() => resumedEngine.ResumeAfterReboot("winboot-v1:4"), "Applied transaction cannot replay resume");
 var externalResume=Fake.Healthy(); var externalRecord=Record(externalResume, Operation.Repair);
-externalRecord.BootId="1"; externalRecord.Status=JournalStatus.RebootRequired; externalRecord.Reboot=true;
+externalRecord.BootId="winboot-v1:1"; externalRecord.Status=JournalStatus.RebootRequired; externalRecord.Reboot=true;
 externalResume.State.Settings=CopySettings(externalResume.State.Settings!); externalResume.State.Settings.Active=false;
-Reject(() => new DriverTransaction(externalResume,new MemoryJournal(),externalRecord).ResumeAfterReboot("2"), "External baseline edit during reboot blocks resume");
-var removeResume=Fake.Healthy(); removeResume.RebootAt="remove-node"; var removeRecord=Record(removeResume,Operation.Uninstall); removeRecord.BootId="1";
+Reject(() => new DriverTransaction(externalResume,new MemoryJournal(),externalRecord).ResumeAfterReboot("winboot-v1:2"), "External baseline edit during reboot blocks resume");
+var removeResume=Fake.Healthy(); removeResume.RebootAt="remove-node"; var removeRecord=Record(removeResume,Operation.Uninstall); removeRecord.BootId="winboot-v1:1";
 var removeEngine=new DriverTransaction(removeResume,new MemoryJournal(),removeRecord);
-Check(removeEngine.Apply()==JournalStatus.RebootRequired, "Node removal requests reboot");
-Check(removeEngine.ResumeAfterReboot("2")==JournalStatus.Applied, "Verified reboot continues package removal");
+Check(removeEngine.Apply("winboot-v1:1")==JournalStatus.RebootRequired, "Node removal requests reboot");
+Check(removeEngine.ResumeAfterReboot("winboot-v1:2")==JournalStatus.Applied, "Verified reboot continues package removal");
 Check(removeResume.Calls.Count(x=>x=="remove-node")==1, "Removed node never replayed");
-var incompleteResume=new Fake { Fail="bind" }; var incompleteRecord=Record(incompleteResume,Operation.Install); incompleteRecord.BootId="1";
+var incompleteResume=new Fake { Fail="bind" }; var incompleteRecord=Record(incompleteResume,Operation.Install); incompleteRecord.BootId="winboot-v1:1";
 var incompleteEngine=new DriverTransaction(incompleteResume,new MemoryJournal(),incompleteRecord);
-Reject(()=>incompleteEngine.Apply(), "Native intent failure");
+Reject(()=>incompleteEngine.Apply("winboot-v1:1"), "Native intent failure");
 incompleteRecord.Status=JournalStatus.RebootRequired; incompleteRecord.Reboot=true;
-Reject(()=>incompleteEngine.ResumeAfterReboot("2"), "Incomplete native intent cannot resume after reboot");
+Reject(()=>incompleteEngine.ResumeAfterReboot("winboot-v1:2"), "Incomplete native intent cannot resume after reboot");
 var retainedFile = Fake.Healthy(); retainedFile.KeepBinary = true; retainedFile.RebootAt = "remove-package";
-var retainedRecord = Record(retainedFile, Operation.Uninstall); retainedRecord.BootId = "1";
+var retainedRecord = Record(retainedFile, Operation.Uninstall); retainedRecord.BootId = "winboot-v1:1";
 var retainedEngine = new DriverTransaction(retainedFile, new MemoryJournal(), retainedRecord);
-Check(retainedEngine.Apply() == JournalStatus.RebootRequired, "Package removal restart retains file for later cleanup");
-Check(retainedEngine.ResumeAfterReboot("2") == JournalStatus.Applied && retainedFile.State.Empty, "Post-reboot cleanup removes only remaining owned file");
+Check(retainedEngine.Apply("winboot-v1:1") == JournalStatus.RebootRequired, "Package removal restart retains file for later cleanup");
+Check(retainedEngine.ResumeAfterReboot("winboot-v1:2") == JournalStatus.Applied && retainedFile.State.Empty, "Post-reboot cleanup removes only remaining owned file");
 Check(retainedFile.Calls.Last() == "remove-binary" && retainedRecord.Steps.Last().Completed, "Final file cleanup is journaled");
 // A failed MSI may leave the native forward prefix waiting for reboot. Undo
 // proceeds only through explicit direction and acknowledged completion writes.
 var rolling = new Fake { KeepBinary = true }; var rollingRecord = Record(rolling, Operation.Install);
 var rollingEngine = new DriverTransaction(rolling, new MemoryJournal(), rollingRecord);
-rollingEngine.Apply();
-Check(rollingEngine.Rollback() == JournalStatus.RollbackRebootRequired && rollingRecord.RollbackDirection, "failed installation records explicit rollback direction");
-Reject(() => rollingEngine.ResumeAfterReboot("1"), "rollback cannot cross same boot");
-Check(rollingEngine.ResumeAfterReboot("2") == JournalStatus.RollbackRebootRequired, "inverse filters require stack restart before node deletion");
+rollingEngine.Apply("winboot-v1:1");
+Check(rollingEngine.Rollback("winboot-v1:1") == JournalStatus.RollbackRebootRequired && rollingRecord.RollbackDirection, "failed installation records explicit rollback direction");
+Reject(() => rollingEngine.ResumeAfterReboot("winboot-v1:1"), "rollback cannot cross same boot");
+Check(rollingEngine.ResumeAfterReboot("winboot-v1:2") == JournalStatus.RollbackRebootRequired, "inverse filters require stack restart before node deletion");
 Check(!rolling.Calls.Contains("remove-node") && rollingRecord.Steps.Where(x => x.Kind == StepKind.Filter).All(x => x.UndoStarted && x.Undone), "filter undo has durable completion before destructive boundary");
 rolling.RebootAt = "remove-node";
-Check(rollingEngine.ResumeAfterReboot("3") == JournalStatus.RollbackRebootRequired, "inverse node removal reboot retained");
+Check(rollingEngine.ResumeAfterReboot("winboot-v1:3") == JournalStatus.RollbackRebootRequired, "inverse node removal reboot retained");
 Check(!rolling.Calls.Contains("remove-package"), "package not removed before node reboot");
 rolling.RebootAt = "remove-package";
-Check(rollingEngine.ResumeAfterReboot("4") == JournalStatus.RollbackRebootRequired, "inverse package removal reboot retained");
+Check(rollingEngine.ResumeAfterReboot("winboot-v1:4") == JournalStatus.RollbackRebootRequired, "inverse package removal reboot retained");
 Check(!rolling.Calls.Contains("remove-binary"), "binary retained through package reboot");
-Check(rollingEngine.ResumeAfterReboot("5") == JournalStatus.RolledBack && rolling.State.Empty, "final postboot proof permits owned binary cleanup");
+Check(rollingEngine.ResumeAfterReboot("winboot-v1:5") == JournalStatus.RolledBack && rolling.State.Empty, "final postboot proof permits owned binary cleanup");
 Check(rollingRecord.RollbackBinaryStarted && rollingRecord.RollbackBinaryCompleted && rollingRecord.Steps.All(x => x.UndoStarted && x.Undone), "undo and final cleanup evidence retained");
 Check(rolling.Calls.Count(x => x == "remove-node") == 1 && rolling.Calls.Count(x => x == "remove-package") == 1, "inverse native operations never replayed");
-Reject(() => rollingEngine.ResumeAfterReboot("6"), "completed rollback cannot replay");
+Reject(() => rollingEngine.ResumeAfterReboot("winboot-v1:6"), "completed rollback cannot replay");
 foreach (string changedPart in new[] { "filters", "settings", "node", "package" })
 {
     var b = new Fake(); var r = Record(b, Operation.Install); var e = new DriverTransaction(b, new MemoryJournal(), r);
-    e.Apply(); e.Rollback(); int calls = b.Calls.Count;
+    e.Apply("winboot-v1:1"); e.Rollback("winboot-v1:1"); int calls = b.Calls.Count;
     if (changedPart == "filters") b.State.Filters[0].Entries = new[] { "Foreign" };
     if (changedPart == "settings") b.State.Settings!.Active = true;
     if (changedPart == "node") b.State.Nodes[0].Id = @"ROOT\SYSTEM\9999";
     if (changedPart == "package") b.State.Packages[0] = "oem99.inf";
-    Reject(() => e.ResumeAfterReboot("2"), "changed rollback prefix rejects " + changedPart);
+    Reject(() => e.ResumeAfterReboot("winboot-v1:2"), "changed rollback prefix rejects " + changedPart);
     Check(b.Calls.Count == calls, "changed prefix performs no undo " + changedPart);
 }
 var uncertainUndo = new Fake(); var uncertainRecord = Record(uncertainUndo, Operation.Install);
 var uncertainEngine = new DriverTransaction(uncertainUndo, new MemoryJournal(), uncertainRecord);
-uncertainEngine.Apply(); uncertainEngine.Rollback(); uncertainUndo.Fail = "filter2";
-Reject(() => uncertainEngine.ResumeAfterReboot("2"), "failed inverse native call retains ambiguity");
+uncertainEngine.Apply("winboot-v1:1"); uncertainEngine.Rollback("winboot-v1:1"); uncertainUndo.Fail = "filter2";
+Reject(() => uncertainEngine.ResumeAfterReboot("winboot-v1:2"), "failed inverse native call retains ambiguity");
 Check(uncertainRecord.Steps.Last().UndoStarted && !uncertainRecord.Steps.Last().Undone && uncertainRecord.Status == JournalStatus.RecoveryRequired, "inverse intent is distinct from completion");
 int uncertainCalls = uncertainUndo.Calls.Count;
-Reject(() => uncertainEngine.Rollback(), "uncertain undo cannot restart rollback");
-Reject(() => uncertainEngine.ResumeAfterReboot("3"), "uncertain undo cannot resume after another reboot");
+Reject(() => uncertainEngine.Rollback("winboot-v1:1"), "uncertain undo cannot restart rollback");
+Reject(() => uncertainEngine.ResumeAfterReboot("winboot-v1:3"), "uncertain undo cannot resume after another reboot");
 Check(uncertainUndo.Calls.Count == uncertainCalls, "ambiguous inverse never replayed");
 var rollbackRepair = Fake.Healthy(); rollbackRepair.State.Filters[1].Entries = new[] { "VendorA", "VendorB" };
 var rollbackRepairRecord = Record(rollbackRepair, Operation.Repair);
 var rollbackRepairEngine = new DriverTransaction(rollbackRepair, new MemoryJournal(), rollbackRepairRecord);
-rollbackRepairEngine.Apply(); rollbackRepairEngine.Rollback();
-Check(rollbackRepairEngine.ResumeAfterReboot("2") == JournalStatus.RollbackRebootRequired, "retained filter repair undo requires restart");
-Check(rollbackRepairEngine.ResumeAfterReboot("3") == JournalStatus.RolledBack && rollbackRepair.State.Settings!.Active, "retained driver baseline survives filter rollback");
+rollbackRepairEngine.Apply("winboot-v1:1"); rollbackRepairEngine.Rollback("winboot-v1:1");
+Check(rollbackRepairEngine.ResumeAfterReboot("winboot-v1:2") == JournalStatus.RollbackRebootRequired, "retained filter repair undo requires restart");
+Check(rollbackRepairEngine.ResumeAfterReboot("winboot-v1:3") == JournalStatus.RolledBack && rollbackRepair.State.Settings!.Active, "retained driver baseline survives filter rollback");
 Check(rollbackRepair.Calls.All(x => x == "filter1"), "filter repair rollback never deletes retained driver");
 var historical = Record(new Fake(), Operation.Install); historical.Status = JournalStatus.RollingBack;
-Reject(() => new DriverTransaction(new Fake(), new MemoryJournal(), historical).Rollback(), "old interrupted rollback has no inferred direction");
+Reject(() => new DriverTransaction(new Fake(), new MemoryJournal(), historical).Rollback("winboot-v1:1"), "old interrupted rollback has no inferred direction");
 historical.Status = JournalStatus.RollbackRebootRequired; historical.Reboot = true;
 Reject(() => ProtectedJournal.Validate(historical), "rollback status requires explicit direction");
 // Simulate power loss after the native inverse call but before its completion
@@ -241,20 +463,25 @@ Reject(() => ProtectedJournal.Validate(historical), "rollback status requires ex
 // in-memory object, then prove it cannot replay the action.
 var crashUndo = new Fake(); var crashRecord = Record(crashUndo, Operation.Install); var crashJournal = new SnapshotJournal();
 var crashEngine = new DriverTransaction(crashUndo, crashJournal, crashRecord);
-crashEngine.Apply(); crashEngine.Rollback(); crashJournal.RejectUndoCompletion = true;
-Reject(() => crashEngine.ResumeAfterReboot("2"), "inverse completion write failure propagates");
+crashEngine.Apply("winboot-v1:1"); crashEngine.Rollback("winboot-v1:1"); crashJournal.RejectUndoCompletion = true;
+Reject(() => crashEngine.ResumeAfterReboot("winboot-v1:2"), "inverse completion write failure propagates");
 var crashed = crashJournal.Load();
 Check(crashed.Steps.Last().UndoStarted && !crashed.Steps.Last().Undone, "durable journal retains unknown inverse intent");
 int crashCalls = crashUndo.Calls.Count;
 var crashRecovery = new DriverTransaction(crashUndo, new MemoryJournal(), crashed);
-Reject(() => crashRecovery.Rollback(), "reloaded inverse intent cannot restart");
-Reject(() => crashRecovery.ResumeAfterReboot("3"), "reloaded inverse intent cannot resume");
+Reject(() => crashRecovery.Rollback("winboot-v1:1"), "reloaded inverse intent cannot restart");
+Reject(() => crashRecovery.ResumeAfterReboot("winboot-v1:3"), "reloaded inverse intent cannot resume");
 Check(crashUndo.Calls.Count == crashCalls, "completion-write crash does not replay native inverse");
 Console.WriteLine($"{checks} driver transaction checks passed.");
 
 sealed class MemoryJournal : ITransactionJournal {
  public int Writes; public int FailWrite;
  public void Save(TransactionRecord record) { if (++Writes == FailWrite) throw new IOException("injected journal failure"); ProtectedJournal.Validate(record); }
+}
+sealed class FixtureLease : IDisposable {
+ readonly Action release;
+ public FixtureLease(Action release) { this.release = release; }
+ public void Dispose() => release();
 }
 sealed class SnapshotJournal : ITransactionJournal {
  public bool RejectUndoCompletion; byte[] saved = Array.Empty<byte>();

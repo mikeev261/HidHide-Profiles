@@ -1,4 +1,29 @@
+## Issue #37 ownership and interruption repair — 2026-10-03
+
+The MSI restart obligation is now durable before worker dispatch, including
+recovered Prepared repair, and retains the actual work boot anchor after an
+interrupted parent. Commit rejects absent saved boot evidence. Application-only
+upgrades retain the no-forced-restart policy. Serialized driver-free fixtures
+cover both dispatch interruption boundaries. MSI and worker journal reads and
+updates now occur under maintenance ownership; queued callers reload the current
+prefix and revalidate the marker after acquisition. Ownership is released before
+child-worker waits. Driver-free interleavings cover advanced native work, terminal
+refusal and legacy anchor retention. Final unified Ci evidence is kept
+under `artifacts/issue-37-r4`. Schema-2 XML now requires explicit restart
+obligation and actual-work anchor evidence; omission, empty and nil-member
+regressions fail closed while legacy XML remains conservatively readable. Real Restart/Fast Startup/hibernation and native
+lifecycle acceptance remain unverified. No installed machine state was changed.
+
 # Unified package progress
+
+## Stable restart verification — issue #37
+
+Restart-dependent native continuation and public-MSI commit now require a
+clock-independent Windows boot sequence. Legacy timestamp journals retain their
+evidence and require an anchored additional restart before continuation. See
+[stable restart verification](stable-restart-verification.md) for contract,
+migration, driver-free validation and outstanding power-mode/native acceptance.
+This source work does not establish installed lifecycle or public release readiness.
 
 ## Most recent application mask — 2026-09-22
 

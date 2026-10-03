@@ -50,7 +50,7 @@ public sealed partial class WindowsSetupHost
         if (record.Operation != operation || record.InitiatingSid != setup.Sid) throw new InvalidDataException("Legacy native recovery identity changed.");
         if (record.Status == JournalStatus.RebootRequired && record.BootId == Boot) return false;
         var transaction = new DriverTransaction(Backend, journal, record);
-        var result = record.Status == JournalStatus.Prepared ? transaction.Apply() : record.Status == JournalStatus.RebootRequired ? transaction.ResumeAfterReboot(Boot) : record.Status;
+        var result = record.Status == JournalStatus.Prepared ? transaction.Apply(Boot) : record.Status == JournalStatus.RebootRequired ? transaction.ResumeAfterReboot(Boot) : record.Status;
         if (result == JournalStatus.RebootRequired) return false;
         if (result != JournalStatus.Applied && result != JournalStatus.Committed)
             throw new InvalidOperationException("Interrupted native recovery must be inspected; original and recovery journals are retained.");

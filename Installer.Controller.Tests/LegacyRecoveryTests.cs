@@ -13,31 +13,31 @@ internal static class LegacyRecoveryTests
     }};
     public static void Run()
     {
-        var setup = Setup(); var record = new LegacyRecoveryRecord { Transaction = setup.Id, Boot = "1" }; var host = new Fake(setup, record); var recovery = new LegacyRecovery(host, setup, record);
+        var setup = Setup(); var record = new LegacyRecoveryRecord { Transaction = setup.Id, Boot = "winboot-v1:1" }; var host = new Fake(setup, record); var recovery = new LegacyRecovery(host, setup, record);
         Check(!recovery.Advance() && host.Calls.Count == 0, "same boot cannot restore or declare legacy worker dead");
-        host.Boot = "2"; Check(!recovery.Advance() && host.Calls.SequenceEqual(new[] { "prepare", "upstream" }), "restores upstream before companion and requests reboot");
+        host.Boot = "winboot-v1:2"; Check(!recovery.Advance() && host.Calls.SequenceEqual(new[] { "prepare", "upstream" }), "restores upstream before companion and requests reboot");
         Check(!recovery.Advance() && host.Calls.Count == 2, "same boot after package cannot continue");
-        host.Boot = "3"; Check(!recovery.Advance() && host.Calls.Last() == "companion", "next boot restores companion");
-        host.Boot = "4"; Check(recovery.Advance() && host.Calls.Skip(3).SequenceEqual(new[] { "driver", "baseline", "verify", "verify", "verify", "clear" }), "complete only after driver baseline and file proof");
+        host.Boot = "winboot-v1:3"; Check(!recovery.Advance() && host.Calls.Last() == "companion", "next boot restores companion");
+        host.Boot = "winboot-v1:4"; Check(recovery.Advance() && host.Calls.Skip(3).SequenceEqual(new[] { "driver", "baseline", "verify", "verify", "verify", "clear" }), "complete only after driver baseline and file proof");
         Check(setup.Legacy.All(x => x.RemovalIntent && !x.Removed) && setup.Phase == SetupPhase.RecoveryRequired, "original uncertain removal journal stays unchanged");
         Check(recovery.Advance() && host.Calls.Last() == "clear", "completed recovery re-verifies before marker cleanup");
         foreach (var phase in new[] { SetupPhase.MsiPending, SetupPhase.MsiApplied, SetupPhase.Restoring, SetupPhase.Complete })
         {
-            setup = Setup(); setup.Phase = phase; record = new() { Transaction = setup.Id, Boot = "1" }; host = new(setup, record) { Boot = "2" };
+            setup = Setup(); setup.Phase = phase; record = new() { Transaction = setup.Id, Boot = "winboot-v1:1" }; host = new(setup, record) { Boot = "winboot-v1:2" };
             Reject(() => new LegacyRecovery(host, setup, record).Advance(), "MSI-owned phase accepted for legacy restore");
             Check(host.Calls.Count == 0, "MSI-owned phase produced no legacy mutations");
         }
-        setup = Setup(); setup.LegacyFiles = null; record = new() { Transaction = setup.Id, Boot = "1" }; host = new(setup, record) { Boot = "2" };
+        setup = Setup(); setup.LegacyFiles = null; record = new() { Transaction = setup.Id, Boot = "winboot-v1:1" }; host = new(setup, record) { Boot = "winboot-v1:2" };
         Reject(() => new LegacyRecovery(host, setup, record).Advance(), "old journal without evidence accepted");
-        setup = Setup(); record = new() { Transaction = setup.Id, Boot = "1" }; host = new(setup, record) { Boot = "2", FailPackage = true }; recovery = new(host, setup, record);
+        setup = Setup(); record = new() { Transaction = setup.Id, Boot = "winboot-v1:1" }; host = new(setup, record) { Boot = "winboot-v1:2", FailPackage = true }; recovery = new(host, setup, record);
         Reject(() => recovery.Advance(), "failed package accepted");
-        Check(record.PackageAttemptBoot == "2" && record.Attempts == 1 && record.PackageIndex == 0, "failed attempt remains durably unknown");
+        Check(record.PackageAttemptBoot == "winboot-v1:2" && record.Attempts == 1 && record.PackageIndex == 0, "failed attempt remains durably unknown");
         Check(!recovery.Advance() && host.Calls.Count == 2, "unknown package is never retried on same boot");
-        host.Boot = "3"; host.FailPackage = false; Check(!recovery.Advance() && record.Attempts == 2, "explicit new-boot retry can repair exact registered ownership");
-        setup = Setup(); record = new() { Transaction = setup.Id, Boot = "1" }; host = new(setup, record) { Boot = "2", Foreign = true };
+        host.Boot = "winboot-v1:3"; host.FailPackage = false; Check(!recovery.Advance() && record.Attempts == 2, "explicit new-boot retry can repair exact registered ownership");
+        setup = Setup(); record = new() { Transaction = setup.Id, Boot = "winboot-v1:1" }; host = new(setup, record) { Boot = "winboot-v1:2", Foreign = true };
         Reject(() => new LegacyRecovery(host, setup, record).Advance(), "foreign owner accepted");
         Check(host.Calls.Count == 0, "foreign product prevented any action");
-        setup = Setup(); record = new() { Transaction = setup.Id, Boot = "1" }; host = new(setup, record) { Boot = "2", FailSave = true };
+        setup = Setup(); record = new() { Transaction = setup.Id, Boot = "winboot-v1:1" }; host = new(setup, record) { Boot = "winboot-v1:2", FailSave = true };
         Reject(() => new LegacyRecovery(host, setup, record).Advance(), "failed durable intent accepted");
         Check(host.Calls.Count == 0, "journal failure prevented mutation");
         Console.WriteLine(count + " legacy recovery engine checks passed; no machine mutations.");
@@ -47,7 +47,7 @@ internal static class LegacyRecoveryTests
         readonly SetupRecord setup; readonly LegacyRecoveryRecord record;
         readonly List<InstalledProduct> products = new();
         public readonly List<string> Calls = new();
-        public string Boot { get; set; } = "1";
+        public string Boot { get; set; } = "winboot-v1:1";
         public bool FailPackage, Foreign, FailSave;
         public Fake(SetupRecord setup, LegacyRecoveryRecord record) { this.setup = setup; this.record = record; }
         public void SaveRecovery(LegacyRecoveryRecord recovery) { if (FailSave) throw new InvalidOperationException("write failure"); }

@@ -8,7 +8,7 @@ static class Tests
     const string Sid = "S-1-5-21-1-2-3-1000";
     static void Check(bool value, string name) { if (!value) throw new Exception(name); checks++; }
     static void Reject(Action action, string name) { try { action(); } catch (Exception) { checks++; return; } throw new Exception("Accepted " + name); }
-    static SetupRecord Record() => new() { Id = Guid.NewGuid(), Sid = Sid, Version = "2.0.0.0", Boot = "1", Before = new DriverState() };
+    static SetupRecord Record() => new() { Id = Guid.NewGuid(), Sid = Sid, Version = "2.0.0.0", Boot = "winboot-v1:1", Before = new DriverState() };
     static LegacyProduct Upstream() => new() { Product = ProductContract.UpstreamProductCode, Family = ProductContract.UpstreamUpgradeCode, Version = "1.5.230" };
     static LegacyProduct Companion() => new() { Product = new Guid("B7E9D4A2-6F31-4E88-9C0D-1A2B6C4D5E70"), Family = ProductContract.CompanionUpgradeCode, Version = "99.0.0.0" };
     static string Ready(bool driverPresent = true, bool baselineAvailable = true)
@@ -46,22 +46,22 @@ static class Tests
         }
         {
             var r = Record();
-            var driver = new TransactionRecord { Id = r.Id, InitiatingSid = r.Sid, Before = r.Before, BootId = "1" };
-            SetupTransaction.VerifyUntouchedDriver(r, driver, r.Before, "1");
+            var driver = new TransactionRecord { Id = r.Id, InitiatingSid = r.Sid, Before = r.Before, BootId = "winboot-v1:1" };
+            SetupTransaction.VerifyUntouchedDriver(r, driver, r.Before, "winboot-v1:1");
             Check(true, "prepared empty native journal proves nonexecution with matching observed state");
             foreach (JournalStatus state in Enum.GetValues(typeof(JournalStatus)))
             {
                 if (state == JournalStatus.Prepared) continue;
                 driver.Status = state;
-                Reject(() => SetupTransaction.VerifyUntouchedDriver(r, driver, r.Before, "1"), "cancel rejects native state " + state);
+                Reject(() => SetupTransaction.VerifyUntouchedDriver(r, driver, r.Before, "winboot-v1:1"), "cancel rejects native state " + state);
             }
             driver.Status = JournalStatus.Prepared; driver.Steps.Add(new Step());
-            Reject(() => SetupTransaction.VerifyUntouchedDriver(r, driver, r.Before, "1"), "intent-only native step prevents safe cancel");
+            Reject(() => SetupTransaction.VerifyUntouchedDriver(r, driver, r.Before, "winboot-v1:1"), "intent-only native step prevents safe cancel");
             driver.Steps.Clear();
-            Reject(() => SetupTransaction.VerifyUntouchedDriver(r, driver, new DriverState { ServiceExists = true }, "1"), "changed native resources prevent safe cancel");
-            Reject(() => SetupTransaction.VerifyUntouchedDriver(r, driver, r.Before, "2"), "boot change prevents unobserved safe cancel");
+            Reject(() => SetupTransaction.VerifyUntouchedDriver(r, driver, new DriverState { ServiceExists = true }, "winboot-v1:1"), "changed native resources prevent safe cancel");
+            Reject(() => SetupTransaction.VerifyUntouchedDriver(r, driver, r.Before, "winboot-v1:2"), "boot change prevents unobserved safe cancel");
             driver.Id = Guid.NewGuid();
-            Reject(() => SetupTransaction.VerifyUntouchedDriver(r, driver, r.Before, "1"), "unrelated native journal cannot authorize retry");
+            Reject(() => SetupTransaction.VerifyUntouchedDriver(r, driver, r.Before, "winboot-v1:1"), "unrelated native journal cannot authorize retry");
         }
         Check(UpgradeProtocol.CompatibleRelatedBundle(UpgradeProtocol.Tag, true, false), "cached compatible bundle");
         Check(!UpgradeProtocol.CompatibleRelatedBundle("", true, false), "preview bundle rejected");
@@ -200,13 +200,13 @@ static class Tests
             var r = Record(); r.Legacy.Add(Upstream()); var h = new Fake(r) { RemoveCode = 3010 }; var tx = new SetupTransaction(h, r);
             Check(tx.Advance() == SetupPhase.WaitingForReboot, "legacy reboot stops MSI");
             Check(tx.Advance() == SetupPhase.WaitingForReboot && h.Removed.Count == 1, "same boot does not advance");
-            h.Boot = "2"; Check(tx.Advance() == SetupPhase.MsiPending && h.Removed.Count == 1, "changed boot does not replay removal");
+            h.Boot = "winboot-v1:2"; Check(tx.Advance() == SetupPhase.MsiPending && h.Removed.Count == 1, "changed boot does not replay removal");
         }
         {
             var r = Record(); var h = new Fake(r); var tx = new SetupTransaction(h, r); tx.Advance();
             Check(tx.MsiCompleted(3010) == SetupPhase.WaitingForReboot, "MSI reboot suspends finalization");
-            h.Boot = "2"; h.MoreReboot = true; Check(tx.Advance() == SetupPhase.WaitingForReboot, "second driver reboot supported");
-            h.Boot = "3"; h.MoreReboot = false; Check(tx.Advance() == SetupPhase.Complete, "multiple reboot finalization");
+            h.Boot = "winboot-v1:2"; h.MoreReboot = true; Check(tx.Advance() == SetupPhase.WaitingForReboot, "second driver reboot supported");
+            h.Boot = "winboot-v1:3"; h.MoreReboot = false; Check(tx.Advance() == SetupPhase.Complete, "multiple reboot finalization");
         }
         {
             var r = Record(); var h = new Fake(r); var tx = new SetupTransaction(h, r); tx.Advance();
@@ -230,9 +230,9 @@ static class Tests
             Check(r.MsiFailureReported && r.MsiRetryCount == 0 && !h.Events.Contains("clear"), "rollback restart preserves terminal failure and baseline without retrying MSI");
             int proofs = h.Events.Count(x => x == "rollback-proof");
             Check(tx.Advance() == SetupPhase.WaitingForReboot && proofs == h.Events.Count(x => x == "rollback-proof"), "same boot never resumes inverse native calls");
-            h.Boot = "2";
+            h.Boot = "winboot-v1:2";
             Check(tx.Advance() == SetupPhase.WaitingForReboot && r.MsiFailureReported && r.MsiRetryCount == 0, "multiple native inverse reboots do not authorize Apply");
-            h.Boot = "3"; h.RollbackReboot = false;
+            h.Boot = "winboot-v1:3"; h.RollbackReboot = false;
             Check(tx.Advance() == SetupPhase.MsiPending && r.MsiRetryCount == 1 && !r.MsiFailureReported, "complete rollback after reboot authorizes only a new MSI attempt");
             Check(!h.Events.Contains("clear"), "rollback recovery does not clear maintenance before new Apply finishes");
         }
@@ -263,6 +263,7 @@ static class Tests
             var native = new TransactionRecord { Id = r.Id, InitiatingSid = r.Sid, Operation = Operation.Install, Before = r.Before };
             MsiRollbackRecovery.VerifyNative(r, native, r.Before);
             Check(true, "untouched native attempt permits verified retry");
+            native.BootId = "winboot-v1:1"; native.RestartAnchor = "winboot-v1:1"; // completed work carries actual-work evidence
             native.Status = JournalStatus.RolledBack; native.Steps.Add(new Step { Kind = StepKind.Bind, Completed = true, Undone = true });
             MsiRollbackRecovery.VerifyNative(r, native, r.Before);
             Check(true, "completed native rollback permits verified retry");
@@ -301,7 +302,7 @@ static class Tests
     {
         readonly SetupRecord record;
         public List<string> Events = new(); public List<Guid> Removed = new();
-        public string Boot { get; set; } = "1";
+        public string Boot { get; set; } = "winboot-v1:1";
         public string Failure = ""; public int RemoveCode; public bool Changed, UnknownProduct, MoreReboot;
         public Fake(SetupRecord r) { record = r; }
         void Event(string value) { Events.Add(value); if (Failure == value) throw new IOException("Injected failure"); }

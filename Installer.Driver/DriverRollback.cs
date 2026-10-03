@@ -70,7 +70,7 @@ public sealed partial class DriverTransaction
             throw new InvalidOperationException("Removed driver still has unexpected ownership or baseline.");
     }
 
-    public JournalStatus Rollback()
+    public JournalStatus Rollback(string currentBootId)
     {
         ProtectedJournal.Validate(record);
         if (record.RollbackDirection || record.Status != JournalStatus.Applied && record.Status != JournalStatus.RecoveryRequired &&
@@ -85,6 +85,7 @@ public sealed partial class DriverTransaction
             journal.Save(record); return record.Status;
         }
         VerifyRollbackPrefix();
+        AnchorNewWork(currentBootId);
         record.RollbackDirection = true;
         return ContinueRollback();
     }
@@ -92,10 +93,11 @@ public sealed partial class DriverTransaction
     JournalStatus ResumeRollbackAfterReboot(string currentBootId)
     {
         if (!record.RollbackDirection || !record.Reboot || !BootIdentity.Valid(record.BootId) ||
-            !BootIdentity.Valid(currentBootId) || record.BootId == currentBootId)
+            !BootIdentity.Stable(currentBootId))
             throw new InvalidOperationException("Explicit rollback direction and a new boot are required.");
         ValidateRollbackOwnership(); VerifyRollbackPrefix();
-        record.BootId = currentBootId; record.Reboot = false;
+        if (!VerifyRestart(currentBootId)) return record.Status;
+        record.RestartAnchor = currentBootId; record.Reboot = false;
         return ContinueRollback();
     }
 

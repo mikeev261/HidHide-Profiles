@@ -10,7 +10,6 @@
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="System.Runtime.Serialization" />
-    <Reference Include="System.Management" />
     <Compile Include="../Installer/DriverFilters.cs" Link="DriverFilters.cs" />
   </ItemGroup>
 </Project>
