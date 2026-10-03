@@ -3,6 +3,7 @@
 // CommandInterpreter.h
 #pragma once
 #include "FilterDriverProxy.h"
+#include "CliDispatch.h"
 
 namespace HidHide
 {
@@ -28,18 +29,7 @@ namespace HidHide
     private:
 
         typedef std::vector<std::wstring> Args;
-        typedef std::function<void(_In_ Args const& args)> ExecuteFunction;
-        typedef std::function<std::wstring(_In_ Args const& args)> ValidateFunction;
-
-        struct RegisteredCommandInfo
-        {
-            std::wstring     syntax;      // Help text explaining the command syntax
-            std::wstring     description; // Help text describing what the command does
-            ExecuteFunction  execute;     // Command handler
-            ValidateFunction validate;    // Argument validation prior to execution
-        };
-
-        typedef std::map<std::wstring, RegisteredCommandInfo> RegisteredCommands;
+        using RegisteredCommands = CliDispatch::RegisteredCommands;
 
         // Execute a sequence of commands
         std::wstring ExecuteCommands(_In_ std::vector<Args> const& commands) const;
@@ -107,7 +97,7 @@ namespace HidHide
         void DevHide(_In_ Args const& args);
 
         // Unhide the device specified
-        void DevUnhinde(_In_ Args const& args);
+        void DevUnhide(_In_ Args const& args);
 
         // Lists the hidden devices
         void DevList(_In_ Args const& args) const;
