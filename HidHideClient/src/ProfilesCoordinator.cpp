@@ -28,13 +28,13 @@ namespace
         FILETIME created{}, exited{}, kernel{}, user{}; if (!::GetProcessTimes(process, &created, &exited, &kernel, &user)) return 0;
         ULARGE_INTEGER value{}; value.LowPart = created.dwLowDateTime; value.HighPart = created.dwHighDateTime; return value.QuadPart;
     }
-    struct ExecutableIdentity
+    struct FileIdentity
     {
         DWORD volume{}, high{}, low{};
-        bool operator==(ExecutableIdentity const& other) const
+        bool operator==(FileIdentity const& other) const
         { return volume == other.volume && high == other.high && low == other.low; }
     };
-    std::optional<ExecutableIdentity> IdentifyExecutable(std::filesystem::path const& path)
+    std::optional<FileIdentity> IdentifyExecutable(std::filesystem::path const& path)
     {
         HANDLE file = ::CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -47,7 +47,17 @@ namespace
         BY_HANDLE_FILE_INFORMATION info{}; auto known = ::GetFileInformationByHandle(file, &info); auto error = ::GetLastError();
         ::CloseHandle(file);
         if (!known) throw std::system_error(error, std::system_category(), "Inspect executable identity");
-        return ExecutableIdentity{ info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow };
+        return FileIdentity{ info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow };
+    }
+    std::optional<FileIdentity> IdentifyDirectory(std::filesystem::path const& path)
+    {
+        HANDLE directory = ::CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (directory == INVALID_HANDLE_VALUE) return std::nullopt;
+        BY_HANDLE_FILE_INFORMATION info{}; auto known = ::GetFileInformationByHandle(directory, &info);
+        ::CloseHandle(directory);
+        if (!known || !(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) return std::nullopt;
+        return FileIdentity{ info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow };
     }
     struct SuspendedProcess { HANDLE process{}; HANDLE thread{}; DWORD processId{}; };
     class DirectLauncher final
@@ -244,8 +254,8 @@ void CProfilesCoordinator::WorkerMain() noexcept
         while (!m_StopRequested)
         {
             auto active = std::any_of(snapshot.profiles.begin(), snapshot.profiles.end(), [](auto const& item) { return item.second.kind == HidHide::Profiles::Kind::Application && item.second.enabled; });
-            if (active) m_WorkerWake.wait_for(lock, std::chrono::milliseconds(500), [&] { return m_StopRequested || revision != m_SubmittedRevision; });
-            else m_WorkerWake.wait(lock, [&] { return m_StopRequested || revision != m_SubmittedRevision; });
+            if (active || m_ReconcileRetryPending) m_WorkerWake.wait_for(lock, std::chrono::milliseconds(500), [&] { return m_StopRequested || revision != m_SubmittedRevision; });
+            else m_WorkerWake.wait(lock, [&] { return m_StopRequested || revision != m_SubmittedRevision || m_ReconcileRetryPending; });
             if (m_StopRequested) break;
             if (revision != m_SubmittedRevision) { snapshot = m_PendingSnapshot; revision = m_SubmittedRevision; }
             lock.unlock();
@@ -254,28 +264,83 @@ void CProfilesCoordinator::WorkerMain() noexcept
             bool changed = revision != m_LastPublishedRevision || result.complete != m_LastPublishedComplete
                 || !m_LastPublishedSelection || result.selection != *m_LastPublishedSelection
                 || result.runningProfiles != m_LastPublishedRunning || result.missingProfiles != m_LastPublishedMissing;
-            if (!changed) continue;
-            m_LastPublishedRevision = revision; m_LastPublishedComplete = result.complete; m_LastPublishedSelection = result.selection;
-            m_LastPublishedRunning = result.runningProfiles; m_LastPublishedMissing = result.missingProfiles;
-            m_Completed = std::move(result); ++m_CompletedSequence;
+            bool retryDue = m_ReconcileRetryPending && std::chrono::steady_clock::now() >= m_ReconcileRetryAt;
+            if (!changed && !retryDue) continue;
+            if (changed)
+            {
+                m_LastPublishedRevision = revision; m_LastPublishedComplete = result.complete; m_LastPublishedSelection = result.selection;
+                m_LastPublishedRunning = result.runningProfiles; m_LastPublishedMissing = result.missingProfiles;
+                m_Completed = std::move(result); ++m_CompletedSequence;
+            }
             auto window = m_NotifyWindow; auto message = m_NotifyMessage; lock.unlock(); if (window && message) ::PostMessageW(window, message, 0, 0); lock.lock();
         }
     }
     catch (...) { std::lock_guard<std::mutex> lock(m_WorkerMutex); m_WorkerFailed = true; }
 }
 
+void CProfilesCoordinator::SetNotificationWindow(HWND window, UINT message)
+{
+    { std::lock_guard<std::mutex> lock(m_WorkerMutex); m_NotifyWindow = window; m_NotifyMessage = message; }
+    // Registration may follow catalog creation or a completed worker scan.
+    // Reload on the owner thread, even if the watcher consumed changes earlier.
+    if (window && message) ::PostMessageW(window, message, 1, 0);
+}
+
 void CProfilesCoordinator::RepositoryWatcherMain() noexcept
 {
-    HANDLE changed = ::FindFirstChangeNotificationW(m_Repository.Root().c_str(), FALSE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE);
-    if (changed == INVALID_HANDLE_VALUE) return;
-    HANDLE waits[]{ m_WatcherStop, changed };
-    while (::WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0 + 1)
+    try
     {
-        HWND window{}; UINT message{}; { std::lock_guard<std::mutex> lock(m_WorkerMutex); window = m_NotifyWindow; message = m_NotifyMessage; }
-        if (window && message) ::PostMessageW(window, message, 1, 0);
-        if (!::FindNextChangeNotification(changed)) break;
+        while (::WaitForSingleObject(m_WatcherStop, 0) == WAIT_TIMEOUT)
+        {
+            // Watch an existing ancestor, including directory names, so both a
+            // not-yet-created repository and a replaced directory stay visible.
+            // Reattach after each change to narrow an initially broader watch.
+            auto ancestor = m_Repository.Root().parent_path(); HANDLE changed = INVALID_HANDLE_VALUE;
+            std::optional<FileIdentity> identity;
+            while (!ancestor.empty())
+            {
+                identity = IdentifyDirectory(ancestor);
+                changed = ::FindFirstChangeNotificationW(ancestor.c_str(), TRUE,
+                    FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE);
+                if (changed != INVALID_HANDLE_VALUE) break;
+                auto parent = ancestor.parent_path(); if (parent == ancestor) break; ancestor = std::move(parent);
+            }
+            if (changed == INVALID_HANDLE_VALUE)
+            {
+                if (::WaitForSingleObject(m_WatcherStop, 1000) != WAIT_TIMEOUT) break;
+                continue;
+            }
+            // Inspect after arming: a creation/write in the reattachment gap is
+            // included in this reload, and later writes signal the new handle.
+            HWND window{}; UINT message{}; { std::lock_guard<std::mutex> lock(m_WorkerMutex); window = m_NotifyWindow; message = m_NotifyMessage; }
+            if (window && message) ::PostMessageW(window, message, 1, 0);
+            HANDLE waits[]{ m_WatcherStop, changed };
+            DWORD wait{};
+            // The notification handle follows a directory object, not its
+            // pathname. Renaming/replacing that ancestor need not signal it.
+            // Revalidate identity at a bounded cadence without reloading an
+            // unchanged catalog or polling the driver during idle periods.
+            do
+            {
+                wait = ::WaitForMultipleObjects(2, waits, FALSE, 1000);
+                if (wait != WAIT_TIMEOUT) break;
+                auto currentIdentity = IdentifyDirectory(ancestor);
+                if (!identity || !currentIdentity || !(*currentIdentity == *identity)) break;
+            } while (wait == WAIT_TIMEOUT);
+            ::FindCloseChangeNotification(changed);
+            if (wait == WAIT_OBJECT_0) break;
+            if (wait != WAIT_OBJECT_0 + 1 && wait != WAIT_TIMEOUT && ::WaitForSingleObject(m_WatcherStop, 1000) != WAIT_TIMEOUT) break;
+        }
     }
-    ::FindCloseChangeNotification(changed);
+    catch (...) {} // A watcher failure must never escape the resident thread.
+}
+
+void CProfilesCoordinator::ScheduleReconcileRetry(bool pending)
+{
+    std::lock_guard<std::mutex> lock(m_WorkerMutex);
+    m_ReconcileRetryPending = pending;
+    if (pending) m_ReconcileRetryAt = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    m_WorkerWake.notify_one();
 }
 
 bool CProfilesCoordinator::ReloadRepositoryIfChanged()
@@ -308,22 +373,24 @@ CProfilesCoordinator::ApplyOutcome CProfilesCoordinator::Reconcile(HidHide::Prof
 {
     // Saving JSON is allowed while recovery/external-driver conflict is
     // unresolved, but no saved=true path may bypass the enforcement block.
-    if (m_RepositoryInvalid) { m_EffectiveVerified = false; return { saved, false, false, saved ? L"Saved, but repository validation remains unresolved; nothing was applied." : m_Status, version }; }
-    if (m_Conflict) { m_EffectiveVerified = false; return { saved, false, false, saved ? L"Saved. Driver recovery or external-state conflict remains unresolved; nothing was applied." : m_Status, version }; }
-    if (m_AdoptedNeedsApply && !saved) return { false, false, true, L"Current driver settings were accepted. Press Apply after reviewing global Allowed apps.", version };
+    if (m_RepositoryInvalid) { ScheduleReconcileRetry(false); m_EffectiveVerified = false; return { saved, false, false, saved ? L"Saved, but repository validation remains unresolved; nothing was applied." : m_Status, version }; }
+    if (m_Conflict) { ScheduleReconcileRetry(false); m_EffectiveVerified = false; return { saved, false, false, saved ? L"Saved. Driver recovery or external-state conflict remains unresolved; nothing was applied." : m_Status, version }; }
+    if (m_AdoptedNeedsApply && !saved) { ScheduleReconcileRetry(false); return { false, false, true, L"Current driver settings were accepted. Press Apply after reviewing global Allowed apps.", version }; }
     try
     {
-        if (m_MaintenanceSource()) return { saved, false, false, saved ? L"Saved. Setup maintenance is active; nothing was activated." : L"Setup maintenance is active", version };
+        if (m_MaintenanceSource()) { ScheduleReconcileRetry(true); return { saved, false, false, saved ? L"Saved. Setup maintenance is active; nothing was activated." : L"Setup maintenance is active", version }; }
     }
     catch (...)
     {
         m_EffectiveVerified = false;
         m_Status = L"Setup maintenance state could not be verified; profile activation is blocked";
+        ScheduleReconcileRetry(true);
         return { saved, false, false, saved ? L"Saved. Setup maintenance state could not be verified; nothing was activated." : m_Status, version };
     }
     if (!selection.verified)
     {
         m_Status = L"Executable identity could not be verified; last verified device visibility was retained";
+        ScheduleReconcileRetry(true);
         return { saved, false, true, saved ? L"Saved. Activation deferred because executable identity is unverified." : m_Status, version };
     }
     auto desired = Desired(m_Snapshot, selection); auto result = m_Enforcement.Reconcile(desired);
@@ -335,11 +402,13 @@ CProfilesCoordinator::ApplyOutcome CProfilesCoordinator::Reconcile(HidHide::Prof
     m_Status = result.failure.empty() ? L"Saved settings could not be applied to the driver" : result.failure;
     m_EffectiveVerified = false;
     if (result.conflict) m_Conflict = true;
+    ScheduleReconcileRetry(!m_Conflict);
     return { saved, false, result.observedKnown, saved ? (result.observedKnown ? L"Profile saved. Device visibility could not be updated." : L"Profile saved. Device visibility is unknown.") : m_Status, version };
 }
 
 void CProfilesCoordinator::SetVerifiedSelection(HidHide::Profiles::Selection const& selection)
 {
+    ScheduleReconcileRetry(false);
     m_Selection = selection; m_Conflict = false; m_AdoptedNeedsApply = false; m_EffectiveVerified = true;
     m_Status = m_Snapshot.settings.paused ? L"Hiding paused — selected Global retained; all devices are visible"
         : selection.reason == HidHide::Profiles::SelectionReason::ManualApplication ? L"Manual override mask applied and verified"
@@ -561,11 +630,11 @@ void CProfilesCoordinator::Tick()
 {
     try
     {
-        if (m_MaintenanceSource()) { m_EffectiveVerified = false; m_Status = L"Setup maintenance is active; profile monitoring is suspended"; return; }
+        if (m_MaintenanceSource()) { ScheduleReconcileRetry(true); m_EffectiveVerified = false; m_Status = L"Setup maintenance is active; profile monitoring is suspended"; return; }
     }
     catch (...)
     {
-        m_EffectiveVerified = false; m_Status = L"Setup maintenance state could not be verified; profile activation is blocked"; return;
+        ScheduleReconcileRetry(true); m_EffectiveVerified = false; m_Status = L"Setup maintenance state could not be verified; profile activation is blocked"; return;
     }
     if (m_LaunchedProcess)
     {
@@ -581,13 +650,16 @@ void CProfilesCoordinator::Tick()
       for (auto it = m_OwnedProcesses.begin(); it != m_OwnedProcesses.end();)
         if (::WaitForSingleObject(*it, 0) == WAIT_OBJECT_0) { ::CloseHandle(*it); it = m_OwnedProcesses.erase(it); } else ++it; }
     ScanResult result; std::uint64_t sequence{};
-    { std::lock_guard<std::mutex> lock(m_WorkerMutex); if (m_WorkerFailed) { m_Status = L"Process monitoring stopped"; return; } if (m_AppliedSequence == m_CompletedSequence) return; result = m_Completed; sequence = m_CompletedSequence; if (result.revision != m_SubmittedRevision) return; }
+    { std::lock_guard<std::mutex> lock(m_WorkerMutex); if (m_WorkerFailed) { m_Status = L"Process monitoring stopped"; return; }
+      if (m_ReconcileRetryPending && std::chrono::steady_clock::now() < m_ReconcileRetryAt) return;
+      if (m_AppliedSequence == m_CompletedSequence && !m_ReconcileRetryPending) return;
+      result = m_Completed; sequence = m_CompletedSequence; if (result.revision != m_SubmittedRevision || !sequence) return; }
     // Every sample advances history, including samples superseded before Tick.
     { std::lock_guard<std::mutex> lock(m_ScanMutex);
       result.selection = m_Activations.Select(m_Snapshot); result.complete = m_LastScanComplete;
       result.runningProfiles.clear(); for (auto const& id : m_Activations.Running()) result.runningProfiles.insert(id); }
     m_RunningProfiles = result.runningProfiles; m_MissingProfiles = result.missingProfiles;
-    if (!CanReconcileScan(result.complete)) { m_EffectiveVerified = false; m_Status = L"Process detection is unavailable; last verified device visibility was retained"; }
+    if (!CanReconcileScan(result.complete)) { ScheduleReconcileRetry(true); m_EffectiveVerified = false; m_Status = L"Process detection is unavailable; last verified device visibility was retained"; }
     else Reconcile(result.selection, false);
     m_AppliedSequence = sequence;
 }
