@@ -479,6 +479,200 @@ namespace
         return true;
     }
 
+    void ExerciseCoordinatorScheduling(std::filesystem::path const& root, std::wstring const& phase)
+    {
+        using namespace HidHide::Profiles;
+        auto require = [](bool condition, char const* message) { if (!condition) throw std::runtime_error(message); };
+        class Enforcement final : public IEnforcement
+        {
+        public:
+            EnforcementResult Observe() override { return { true, true, state, {} }; }
+            EnforcementResult Reconcile(DesiredEnforcement const& desired) override
+            {
+                ++attempts;
+                if (fail) return { false, false, {}, L"Transient test read failure", conflict };
+                if (!(state == desired)) { state = desired; ++writes; }
+                return { true, true, state, {} };
+            }
+            EnforcementResult RestoreBaseline() override { ++restores; return { true, true, state, {} }; }
+            EnforcementResult AdoptCurrentAsBaseline() override { throw std::runtime_error("Unexpected baseline adoption"); }
+            DesiredEnforcement state;
+            unsigned attempts{}, writes{}, restores{};
+            bool fail{}, conflict{};
+        } enforcement;
+        // Only posted coordinator notifications drive Tick after the initial
+        // startup call, just as the resident dialog's OnProfileChanged does.
+        class Notifications
+        {
+        public:
+            explicit Notifications(CProfilesCoordinator& coordinator) : owner(coordinator)
+            {
+                window = ::CreateWindowExW(0, L"STATIC", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, nullptr, nullptr);
+                if (!window) throw std::runtime_error("Could not create coordinator notification fixture");
+                owner.SetNotificationWindow(window, WM_APP + 73); owner.Tick();
+            }
+            ~Notifications() { owner.SetNotificationWindow(nullptr, 0); ::DestroyWindow(window); }
+            void Pump()
+            {
+                MSG message{};
+                while (::PeekMessageW(&message, window, WM_APP + 73, WM_APP + 73, PM_REMOVE))
+                {
+                    if (message.wParam) { ++repositoryEvents; owner.ReloadRepositoryIfChanged(); }
+                    owner.Tick();
+                }
+            }
+            bool Await(std::function<bool()> const& condition, DWORD timeout = 4500)
+            {
+                auto deadline = ::GetTickCount64() + timeout;
+                do { Pump(); if (condition()) return true; ::Sleep(10); } while (::GetTickCount64() < deadline);
+                Pump(); return condition();
+            }
+            void For(DWORD duration) { (void)Await([] { return false; }, duration); }
+            unsigned repositoryEvents{};
+        private:
+            CProfilesCoordinator& owner; HWND window{};
+        };
+
+        if (phase == L"coordinator-late-registration")
+        {
+            // Let the watcher arm and consume creation before any HWND exists.
+            // A Global-only worker cannot fabricate a later process notification.
+            auto catalogRoot = root / L"HidHide Profiles" / L"Profiles";
+            std::filesystem::create_directories(catalogRoot.parent_path());
+            CProfilesCoordinator coordinator(enforcement, catalogRoot, false, {}, {}, [] { return false; });
+            ::Sleep(650);
+            ProfileApplicationService application(catalogRoot); application.OpenOrCreate();
+            ::Sleep(1250);
+            require(coordinator.HasRepositoryDiagnostics() && enforcement.attempts == 0,
+                "Late-registration fixture did not start from the absent catalog");
+            auto before = ReadBytes(catalogRoot / L"settings.json");
+            Notifications notifications(coordinator);
+            require(notifications.Await([&] { return !coordinator.HasRepositoryDiagnostics() && coordinator.EffectiveSelectionVerified(); }),
+                "Notification registration lost the catalog created before the HWND existed");
+            require(ReadBytes(catalogRoot / L"settings.json") == before && coordinator.RepositoryWriteCount() == 0 && enforcement.restores == 0,
+                "Late notification registration mutated the catalog or baseline");
+            return;
+        }
+        if (phase == L"coordinator-parent-replacement")
+        {
+            // The watched parent itself moves; do not rename the shared temp
+            // directory used by the other isolated fixtures.
+            auto catalogRoot = root / L"HidHide Profiles" / L"Profiles";
+            ProfileApplicationService application(catalogRoot); application.OpenOrCreate();
+            CProfilesCoordinator coordinator(enforcement, catalogRoot, false, {}, {}, [] { return false; });
+            Notifications notifications(coordinator);
+            require(notifications.Await([&] { return coordinator.EffectiveSelectionVerified(); }), "Parent fixture failed initial activation");
+            notifications.For(650);
+            auto originalParent = root / L"original-parent";
+            std::filesystem::rename(catalogRoot.parent_path(), originalParent);
+            std::filesystem::copy(originalParent, catalogRoot.parent_path(), std::filesystem::copy_options::recursive);
+            notifications.For(1250);
+            auto settings = RepositoryView(catalogRoot).Load().snapshot.settings; settings.paused = true;
+            application.ApplySettings(settings, application.SettingsVersion());
+            require(notifications.Await([&] { return coordinator.Snapshot().settings.paused && coordinator.EffectiveSelectionVerified(); }),
+                "Watcher missed edits after its watched parent was replaced");
+            settings.paused = false; application.ApplySettings(settings, application.SettingsVersion());
+            require(notifications.Await([&] { return !coordinator.Snapshot().settings.paused && coordinator.EffectiveSelectionVerified(); }),
+                "Watcher failed to remain attached to the replacement parent");
+            require(coordinator.RepositoryWriteCount() == 0 && enforcement.restores == 0, "Parent watcher mutated catalog or baseline");
+            return;
+        }
+        if (phase == L"coordinator-watcher")
+        {
+            // Do not create the repository until the watcher has attempted to
+            // attach. This also covers the otherwise dormant Global-only worker.
+            // Both catalogs remain inside the parent fixture's cleanup boundary.
+            auto catalogRoot = root / L"Profiles";
+            std::filesystem::create_directories(root);
+            CProfilesCoordinator coordinator(enforcement, catalogRoot, false, {}, {}, [] { return false; });
+            Notifications notifications(coordinator); notifications.For(650);
+            require(!std::filesystem::exists(catalogRoot), "Coordinator created a repository as a watcher workaround");
+            ProfileApplicationService application(catalogRoot); application.OpenOrCreate();
+            require(notifications.Await([&] { return !coordinator.HasRepositoryDiagnostics() && coordinator.EffectiveSelectionVerified(); }),
+                "Late-created repository was never loaded through watcher notification");
+            auto settings = coordinator.Snapshot().settings; settings.paused = true;
+            application.ApplySettings(settings, application.SettingsVersion());
+            require(notifications.Await([&] { return coordinator.Snapshot().settings.paused && coordinator.EffectiveSelectionVerified(); }),
+                "Watcher missed later changes after repository creation");
+            auto original = root / L"original-repository";
+            std::filesystem::rename(catalogRoot, original);
+            notifications.For(650); std::filesystem::create_directories(catalogRoot);
+            for (auto const& entry : std::filesystem::directory_iterator(original))
+                std::filesystem::copy_file(entry.path(), catalogRoot / entry.path().filename());
+            require(notifications.Await([&] { return !coordinator.HasRepositoryDiagnostics(); }), "Watcher did not recover after repository replacement");
+            settings.paused = false; application.ApplySettings(settings, application.SettingsVersion());
+            require(notifications.Await([&] { return !coordinator.Snapshot().settings.paused && coordinator.EffectiveSelectionVerified(); }),
+                "Watcher stayed attached to a removed repository");
+            require(coordinator.RepositoryWriteCount() == 0 && enforcement.restores == 0, "Watcher mutated repository or baseline");
+            return;
+        }
+
+        ProfileApplicationService application(root); auto loaded = application.OpenOrCreate();
+        Profile game; game.id = NewStableId(); game.revision = 1; game.name = L"Coordinator fixture";
+        game.kind = Kind::Application; game.executable = NormalizeExecutable(root / L"CoordinatorFixture.exe");
+        game.rules.push_back({ L"HID\\FIXTURE\\ONLY", L"Fixture", Visibility::Hidden });
+        if (phase == L"coordinator-missing" || phase == L"coordinator-incomplete") application.Apply(game, std::nullopt);
+        auto settingsBytes = ReadBytes(root / L"settings.json");
+        auto globalBytes = ReadBytes(root / (loaded.snapshot.settings.selectedGlobalId + L".json"));
+        bool maintenance{}; std::atomic_bool incomplete{ false };
+        CProfilesCoordinator::ProcessSource processes;
+        if (phase == L"coordinator-incomplete") processes = [&]
+        {
+            if (incomplete.load()) throw std::runtime_error("Temporarily incomplete process scan");
+            return std::vector<ProcessObservation>{{4242, 1, game.executable.filename().native(), game.executable, true}};
+        };
+        enforcement.fail = phase != L"coordinator-missing";
+        enforcement.conflict = phase == L"coordinator-conflict";
+        CProfilesCoordinator coordinator(enforcement, root, false, processes, {}, [&] { return maintenance; });
+        Notifications notifications(coordinator);
+        if (phase == L"coordinator-missing")
+        {
+            require(notifications.Await([&] { return coordinator.IsApplicationMissing(game.id); }), "Missing executable was not detected");
+            { std::ofstream executable(game.executable); executable << "fixture; never executed"; }
+            require(notifications.Await([&] { return !coordinator.IsApplicationMissing(game.id); }), "Executable creation left stale missing diagnostics");
+            std::filesystem::rename(game.executable, root / L"MovedFixture.exe");
+            require(notifications.Await([&] { return coordinator.IsApplicationMissing(game.id); }), "Executable move left stale missing diagnostics");
+        }
+        else
+        {
+            require(notifications.Await([&] { return enforcement.attempts == 1; }), "Initial reconciliation was not attempted");
+            // Rapid explicit ticks must not bypass the retry delay.
+            for (unsigned i{}; i < 100; ++i) coordinator.Tick();
+            notifications.For(250);
+            require(enforcement.attempts == 1, "Transient failure caused immediate repeated driver calls");
+            if (phase == L"coordinator-conflict")
+            {
+                enforcement.fail = false; notifications.For(1750);
+                require(coordinator.HasDriverConflict() && !coordinator.EffectiveSelectionVerified() && enforcement.attempts == 1,
+                    "Automatic retry bypassed the conflict/recovery guard");
+            }
+            else
+            {
+                if (phase == L"coordinator-incomplete") incomplete = true;
+                if (phase == L"coordinator-maintenance") maintenance = true;
+                if (maintenance || incomplete.load())
+                {
+                    enforcement.fail = false; notifications.For(1750);
+                    require(enforcement.attempts == 1 && !coordinator.EffectiveSelectionVerified(), "Retry bypassed maintenance or incomplete scan");
+                    incomplete = false; maintenance = false;
+                }
+                else
+                {
+                    notifications.For(1750);
+                    require(enforcement.attempts >= 2 && enforcement.attempts <= 3, "Persistent transient failure lacked bounded scheduled retries");
+                    enforcement.fail = false;
+                }
+                require(notifications.Await([&] { return coordinator.EffectiveSelectionVerified(); }), "Unchanged policy did not recover through scheduled notification");
+                auto attempts = enforcement.attempts; auto writes = enforcement.writes;
+                notifications.For(1250);
+                require(enforcement.attempts == attempts && enforcement.writes == writes && writes == 1, "Successful reconciliation kept retrying or wrote unnecessarily");
+                if (phase == L"coordinator-incomplete") require(coordinator.EffectiveSelection().profileId == game.id, "Retry lost newest running profile");
+            }
+        }
+        require(ReadBytes(root / L"settings.json") == settingsBytes && ReadBytes(root / (loaded.snapshot.settings.selectedGlobalId + L".json")) == globalBytes
+            && coordinator.RepositoryWriteCount() == 0 && enforcement.restores == 0, "Automatic scheduling wrote catalog or restored baseline");
+    }
+
     // Cross-process acceptance exercises the current editor service without constructing
     // retired profile controls. Only the device-coalescer phase needs a hidden HWND.
     bool RunProfileRestartWorker()
@@ -515,7 +709,11 @@ namespace
                 ::SetEvent(completed); ::Sleep(INFINITE);
             }
             AcceptanceEnforcement enforcement; AcceptanceDevices devices;
-            if (phase == L"device-coalescing")
+            if (phase.rfind(L"coordinator-", 0) == 0)
+            {
+                ExerciseCoordinatorScheduling(root, phase); finish();
+            }
+            else if (phase == L"device-coalescing")
             {
                 ProfilesAcceptanceContext context{root, enforcement, devices, [] { return std::vector<ProcessObservation>{}; }};
                 CHidHideClientDlg dialog(nullptr, context);
