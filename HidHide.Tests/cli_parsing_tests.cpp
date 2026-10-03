@@ -76,3 +76,96 @@ TEST(CliParsing, ExtractCommands_syntaxError_returnsEmpty)
     auto const cmds{ ExtractCommands(s) };
     EXPECT_TRUE(cmds.empty());
 }
+
+#include "CliDispatch.h"
+#include <stdexcept>
+
+namespace
+{
+    struct BatchFixture
+    {
+        bool staged{};
+        bool persisted{};
+        int handlers{};
+        HidHide::CliDispatch::RegisteredCommands commands;
+        explicit BatchFixture(bool writeThrough = false)
+        {
+            auto noArguments = [](HidHide::CliParsing::Args const& args)
+            { return args.size() == 1 ? std::wstring{} : L"wrong arguments"; };
+            commands[L"cloak-on"] = { {}, {}, [this, writeThrough](auto const&)
+            { ++handlers; staged = true; if (writeThrough) persisted = staged; }, noArguments };
+            commands[L"cloak-toggle"] = { {}, {}, [this, writeThrough](auto const&)
+            { ++handlers; staged = !staged; if (writeThrough) persisted = staged; }, noArguments };
+            commands[L"fail"] = { {}, {}, [](auto const&)
+            { throw std::runtime_error("handler failed"); }, noArguments };
+        }
+        std::wstring Run(std::wstring line)
+        {
+            auto batch = ExtractCommands(line);
+            if (!line.empty()) return L"syntax error";
+            return HidHide::CliDispatch::ExecuteCommands(batch, commands, L"unknown command");
+        }
+    };
+}
+
+TEST(CliDispatch, LaterUnknownRejectsBeforeStagingOrWriteThrough)
+{
+    for (bool live : { false, true })
+    {
+        BatchFixture fixture(live);
+        EXPECT_EQ(L"unknown command", fixture.Run(L"--cloak-on --missing"));
+        EXPECT_EQ(0, fixture.handlers);
+        EXPECT_FALSE(fixture.staged);
+        EXPECT_FALSE(fixture.persisted);
+    }
+}
+
+TEST(CliDispatch, LaterInvalidArgumentsRejectBeforeStagingOrWriteThrough)
+{
+    for (bool live : { false, true })
+    {
+        BatchFixture fixture(live);
+        EXPECT_EQ(L"wrong arguments", fixture.Run(L"--cloak-on --cloak-toggle extra"));
+        EXPECT_EQ(0, fixture.handlers);
+        EXPECT_FALSE(fixture.staged);
+        EXPECT_FALSE(fixture.persisted);
+    }
+}
+
+TEST(CliDispatch, ValidBatchRetainsOrderAndStagedCommit)
+{
+    BatchFixture fixture;
+    EXPECT_TRUE(fixture.Run(L"--cloak-on --cloak-toggle --cloak-toggle").empty());
+    EXPECT_EQ(3, fixture.handlers);
+    EXPECT_TRUE(fixture.staged);
+    EXPECT_FALSE(fixture.persisted);
+    fixture.persisted = fixture.staged; // Interpreter commits only after input completes.
+    EXPECT_TRUE(fixture.persisted);
+}
+
+TEST(CliDispatch, RejectedInteractiveLinePreservesEarlierValidLine)
+{
+    BatchFixture fixture;
+    ASSERT_TRUE(fixture.Run(L"--cloak-on").empty());
+    EXPECT_EQ(L"unknown command", fixture.Run(L"--cloak-toggle --missing"));
+    EXPECT_EQ(1, fixture.handlers);
+    EXPECT_TRUE(fixture.staged);
+    fixture.persisted = fixture.staged;
+    EXPECT_TRUE(fixture.persisted);
+}
+
+TEST(CliDispatch, RuntimeHandlerFailurePropagatesWithoutAtomicityPromise)
+{
+    BatchFixture fixture(true);
+    try
+    {
+        fixture.Run(L"--cloak-on --fail --cloak-toggle");
+        FAIL();
+    }
+    catch (std::runtime_error const& error)
+    {
+        EXPECT_STREQ("handler failed", error.what());
+    }
+    EXPECT_EQ(1, fixture.handlers);
+    EXPECT_TRUE(fixture.persisted);
+}

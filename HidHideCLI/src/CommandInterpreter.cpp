@@ -31,7 +31,7 @@ namespace HidHide
             if (!errorMessage.empty())
             {
                 std::wcerr << errorMessage << std::endl;
-                if (!m_InteractiveMode) throw std::runtime_error("Command rejected; no configuration changes were applied");
+                if (!m_InteractiveMode) throw std::runtime_error("Command batch rejected before execution");
             }
 
             // Bail out on cancellation
@@ -51,15 +51,8 @@ namespace HidHide
     {
         TRACE_ALWAYS(L"");
 
-        for (auto const& command : commands)
-        {
-            auto const commandInfo{ m_RegisteredCommands.find(command.at(0)) };
-            if (std::end(m_RegisteredCommands) == commandInfo) return (HidHide::StringTable(IDS_COMMAND_NOT_RECOGNIZED));
-            if (auto const result{ commandInfo->second.validate(command) }; !result.empty()) return (result);
-            commandInfo->second.execute(command);
-        }
-
-        return (std::wstring{});
+        return CliDispatch::ExecuteCommands(commands, m_RegisteredCommands,
+            HidHide::StringTable(IDS_COMMAND_NOT_RECOGNIZED));
     }
 
     _Use_decl_annotations_

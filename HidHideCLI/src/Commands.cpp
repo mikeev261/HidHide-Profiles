@@ -113,7 +113,7 @@ namespace HidHide
             { L"dev-gaming",   { StringTable(IDS_CLI_SYNTAX_NO_ARGUMENTS),  StringTable(IDS_CLI_DEV_GAMING),   std::bind(&CommandInterpreter::DevGaming,   this, std::placeholders::_1), std::bind(&CommandInterpreter::ValNoArguments, this, std::placeholders::_1) } },
             { L"dev-hide",     { StringTable(IDS_CLI_SYNTAX_DEV_INST_PATH), StringTable(IDS_CLI_DEV_HIDE),     std::bind(&CommandInterpreter::DevHide,     this, std::placeholders::_1), std::bind(&CommandInterpreter::ValOneDeviceInstancePath, this, std::placeholders::_1) } },
             { L"dev-list",     { StringTable(IDS_CLI_SYNTAX_NO_ARGUMENTS),  StringTable(IDS_CLI_DEV_LIST),     std::bind(&CommandInterpreter::DevList,     this, std::placeholders::_1), std::bind(&CommandInterpreter::ValNoArguments, this, std::placeholders::_1) } },
-            { L"dev-unhide",   { StringTable(IDS_CLI_SYNTAX_DEV_INST_PATH), StringTable(IDS_CLI_DEV_UNHIDE),   std::bind(&CommandInterpreter::DevUnhinde,  this, std::placeholders::_1), std::bind(&CommandInterpreter::ValOneDeviceInstancePath, this, std::placeholders::_1) } },
+            { L"dev-unhide",   { StringTable(IDS_CLI_SYNTAX_DEV_INST_PATH), StringTable(IDS_CLI_DEV_UNHIDE),   std::bind(&CommandInterpreter::DevUnhide,  this, std::placeholders::_1), std::bind(&CommandInterpreter::ValOneDeviceInstancePath, this, std::placeholders::_1) } },
             { L"help",         { StringTable(IDS_CLI_SYNTAX_NO_ARGUMENTS),  StringTable(IDS_CLI_HELP),         std::bind(&CommandInterpreter::Help,        this, std::placeholders::_1), std::bind(&CommandInterpreter::ValNoArguments, this, std::placeholders::_1) } },
             { L"version",      { StringTable(IDS_CLI_SYNTAX_NO_ARGUMENTS),  StringTable(IDS_CLI_VERSION),      std::bind(&CommandInterpreter::Version,     this, std::placeholders::_1), std::bind(&CommandInterpreter::ValNoArguments, this, std::placeholders::_1) } }
           }
@@ -236,7 +236,7 @@ namespace HidHide
     }
 
     _Use_decl_annotations_
-    void CommandInterpreter::DevUnhinde(Args const& args)
+    void CommandInterpreter::DevUnhide(Args const& args)
     {
         TRACE_ALWAYS(L"");
         m_FilterDriverProxy.BlacklistDelEntry(args.at(1));
