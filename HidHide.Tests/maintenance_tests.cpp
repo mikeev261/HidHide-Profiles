@@ -32,6 +32,30 @@ TEST(Maintenance, UninstallRemovesOnlyExactOwnedStartupCommands) {
     EXPECT_FALSE(exists(L"HidHide App Profiles"));
     EXPECT_TRUE(exists(L"Other App"));
 }
+TEST(Maintenance, StartupCleanupPreservesOversizedAndEmbeddedNullValues) {
+    auto path = L"Software\\HidHide.Tests\\StartupBounds-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64());
+    HKEY key{};
+    ASSERT_EQ(ERROR_SUCCESS, RegCreateKeyExW(HKEY_CURRENT_USER, path.c_str(), 0, nullptr, 0, KEY_ALL_ACCESS, nullptr, &key, nullptr));
+    struct Cleanup { HKEY key; std::wstring path; ~Cleanup() { RegCloseKey(key); RegDeleteKeyW(HKEY_CURRENT_USER, path.c_str()); } } cleanup{key,path};
+    std::wstring owned = L"\"C:\\Program Files\\HidHide\\HidHideClient.exe\" --background";
+    auto write = [&](std::wstring const& value) {
+        ASSERT_EQ(ERROR_SUCCESS, RegSetValueExW(key, L"HidHide Profiles", 0, REG_SZ, reinterpret_cast<BYTE const*>(value.c_str()), static_cast<DWORD>((value.size()+1)*sizeof(wchar_t))));
+    };
+    for (auto const& value : { std::wstring(32768, L'x'), owned + std::wstring(1, L'\0') + L"foreign" }) {
+        write(value);
+        RemoveOwnedStartupValues(key, owned, L"legacy");
+        DWORD bytes{};
+        EXPECT_EQ(ERROR_SUCCESS, RegQueryValueExW(key, L"HidHide Profiles", nullptr, nullptr, nullptr, &bytes));
+        EXPECT_EQ((value.size()+1)*sizeof(wchar_t), bytes);
+        std::vector<wchar_t> preserved(value.size()+1);
+        ASSERT_EQ(ERROR_SUCCESS, RegQueryValueExW(key, L"HidHide Profiles", nullptr, nullptr,
+            reinterpret_cast<BYTE*>(preserved.data()), &bytes));
+        EXPECT_EQ(value, std::wstring(preserved.data(), value.size()));
+    }
+    write(owned);
+    RemoveOwnedStartupValues(key, owned, L"legacy");
+    EXPECT_EQ(ERROR_FILE_NOT_FOUND, RegQueryValueExW(key, L"HidHide Profiles", nullptr, nullptr, nullptr, nullptr));
+}
 TEST(Maintenance, MsiSessionUsesOnlyStrictTransactionIdentities) {
     auto const valid = std::wstring(L"01234567-89ab-cdef-0123-456789abcdef");
     EXPECT_TRUE(ValidMsiTransactionId(valid));

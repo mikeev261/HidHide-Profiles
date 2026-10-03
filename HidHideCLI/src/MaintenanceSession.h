@@ -3,6 +3,7 @@
 #include "FilterDriverProxy.h"
 #include "StartupEntry.h"
 #include <iostream>
+#include <vector>
 
 namespace HidHide
 {
@@ -10,9 +11,11 @@ namespace HidHide
     {
         for (auto name : { L"HidHide Profiles", L"HidHide App Profiles" })
         {
-            wchar_t value[32768]{}; DWORD bytes = sizeof(value);
-            if (::RegGetValueW(run, nullptr, name, RRF_RT_REG_SZ, nullptr, value, &bytes) == ERROR_SUCCESS
-                && OwnedStartupCommand(std::wstring(value), currentCommand, legacyCommand))
+            std::vector<wchar_t> value(32768); DWORD bytes = static_cast<DWORD>(value.size() * sizeof(wchar_t));
+            if (::RegGetValueW(run, nullptr, name, RRF_RT_REG_SZ, nullptr, value.data(), &bytes) == ERROR_SUCCESS
+                && bytes >= sizeof(wchar_t) && bytes <= value.size() * sizeof(wchar_t) && bytes % sizeof(wchar_t) == 0
+                && value[bytes / sizeof(wchar_t) - 1] == L'\0'
+                && OwnedStartupCommand(std::wstring(value.data(), bytes / sizeof(wchar_t) - 1), currentCommand, legacyCommand))
             {
                 auto removed = ::RegDeleteValueW(run, name);
                 if (removed != ERROR_SUCCESS && removed != ERROR_FILE_NOT_FOUND)
@@ -38,10 +41,10 @@ namespace HidHide
             && ::RegGetValueW(marker, nullptr, L"RestartRequired", RRF_RT_REG_DWORD, nullptr, &restart, &size) == ERROR_SUCCESS && restart == 1;
         ::RegCloseKey(marker);
         if (!confirmed) return;
-        wchar_t image[32768]{};
-        auto length = ::GetModuleFileNameW(nullptr, image, static_cast<DWORD>(std::size(image)));
-        if (!length || length >= std::size(image)) throw std::runtime_error("Cannot identify the installed startup command");
-        auto directory = std::filesystem::path(image).parent_path();
+        std::vector<wchar_t> image(32768);
+        auto length = ::GetModuleFileNameW(nullptr, image.data(), static_cast<DWORD>(image.size()));
+        if (!length || length >= image.size()) throw std::runtime_error("Cannot identify the installed startup command");
+        auto directory = std::filesystem::path(std::wstring(image.data(), length)).parent_path();
         auto currentCommand = L"\"" + (directory / L"HidHideClient.exe").wstring() + L"\" --background";
         auto legacyCommand = L"\"" + (directory.parent_path() / L"HidHide App Profiles" / L"HidHideClient.exe").wstring() + L"\" --background";
         HKEY run{};
