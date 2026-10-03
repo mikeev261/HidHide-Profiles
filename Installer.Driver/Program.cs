@@ -8,19 +8,18 @@ public static class Program
             if (args.Length == 2 && (args[0] == "--apply" || args[0] == "--rollback" || args[0] == "--resume") && Guid.TryParseExact(args[1], "D", out var id))
             {
                 var journal = new ProtectedJournal(id);
-                var record = journal.Load();
                 // The public MSI establishes a protected marker before invoking
                 // any worker. Reopen that durable transaction for apply,
                 // rollback and post-reboot continuation alike.
-                using var lease = new MaintenanceLease(id, recovery: true);
+                using var owned = new OwnedJournal<MaintenanceLease>(() => new MaintenanceLease(id, recovery: true), journal.Load);
+                var lease = owned.Lease; var record = owned.Record;
                 var backend = new WindowsDriverBackend(Path.Combine(ProtectedJournal.Root, "payload"), lease.AssertHeld);
                 Payload.Verify(Path.Combine(ProtectedJournal.Root, "payload"));
                 // No ordinary-user command can create this protected record or
                 // approve resources. Setup must prepare it before invoking MSI.
                 lease.MarkPending(args[0] == "--rollback");
                 var transaction = new DriverTransaction(backend, journal, record);
-                if (args[0] == "--apply" && string.IsNullOrEmpty(record.BootId)) { record.BootId = BootIdentity.Current(); journal.Save(record); }
-                var outcome = args[0] == "--apply" ? transaction.Apply() : args[0] == "--resume" ? transaction.ResumeAfterReboot(BootIdentity.Current()) : transaction.Rollback();
+                var outcome = args[0] == "--apply" ? transaction.Apply(BootIdentity.Current()) : args[0] == "--resume" ? transaction.ResumeAfterReboot(BootIdentity.Current()) : transaction.Rollback(BootIdentity.Current());
                 Console.WriteLine("Driver transaction: " + id + "; outcome: " + outcome);
                 return outcome == JournalStatus.RebootRequired || outcome == JournalStatus.RollbackRebootRequired ? 3010 : 0;
             }

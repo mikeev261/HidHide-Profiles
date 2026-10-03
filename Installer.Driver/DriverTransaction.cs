@@ -21,7 +21,7 @@ public sealed class Step
 [DataContract]
 public sealed class TransactionRecord
 {
-    [DataMember] public int Schema { get; set; } = 1;
+    [DataMember] public int Schema { get; set; } = 2;
     [DataMember] public Guid Id { get; set; }
     [DataMember] public string InitiatingSid { get; set; } = "";
     [DataMember] public string PayloadIdentity { get; set; } = Payload.InfHash;
@@ -32,6 +32,25 @@ public sealed class TransactionRecord
     [DataMember] public bool Reboot { get; set; }
     [DataMember] public string Failure { get; set; } = "";
     [DataMember] public string BootId { get; set; } = "";
+    // Legacy timestamps remain evidence. This separate anchor is populated on
+    // first recovery and requires another verified boot before continuation.
+    [DataMember] public string RestartAnchor { get; set; } = "";
+    bool commitRebootRequired;
+    bool commitRebootEvidencePresent = true;
+    [DataMember] public bool CommitRebootRequired
+    {
+        get => commitRebootRequired;
+        set { commitRebootRequired = value; commitRebootEvidencePresent = true; }
+    }
+    internal bool HasCommitRebootEvidence => commitRebootEvidencePresent;
+    // Only called after validation, when schema-1 evidence is conservatively
+    // migrated or a Prepared transaction starts work in a verified current boot.
+    internal void AnchorRestartEvidence(string anchor)
+    { Schema = 2; RestartAnchor = anchor; commitRebootEvidencePresent = true; }
+    // DataContractSerializer bypasses constructors and field initializers.
+    // An omitted bool must not be indistinguishable from an explicit false.
+    [OnDeserializing]
+    void BeginRead(StreamingContext context) { commitRebootEvidencePresent = false; }
     [DataMember] public bool RollbackDirection { get; set; }
     [DataMember] public bool RollbackBinaryStarted { get; set; }
     [DataMember] public bool RollbackBinaryCompleted { get; set; }
@@ -49,6 +68,49 @@ public sealed partial class DriverTransaction
     public DriverTransaction(IDriverBackend backend, ITransactionJournal journal, TransactionRecord record)
     { this.backend = backend; this.journal = journal; this.record = record; }
     bool Reconstructing => record.Operation == Operation.Repair && !record.Before.CoreHealthy;
+    void AnchorNewWork(string currentBootId)
+    {
+        ProtectedJournal.Validate(record);
+        if (!BootIdentity.Stable(currentBootId)) throw new InvalidOperationException("A stable boot identity is required.");
+        if (string.IsNullOrEmpty(record.BootId)) record.BootId = currentBootId;
+        record.AnchorRestartEvidence(currentBootId); journal.Save(record);
+    }
+    bool VerifyRestart(string currentBootId)
+    {
+        if (!BootIdentity.Stable(currentBootId)) throw new InvalidOperationException("A stable current boot identity is required.");
+        string anchor = string.IsNullOrEmpty(record.RestartAnchor) ? record.BootId : record.RestartAnchor;
+        if (BootIdentity.Legacy(anchor))
+        {
+            record.AnchorRestartEvidence(currentBootId); journal.Save(record);
+            return false;
+        }
+        if (!BootIdentity.Changed(anchor, currentBootId))
+            throw new InvalidOperationException("Restart Windows before continuing protected maintenance.");
+        return true;
+    }
+    // Persist the MSI lifecycle obligation before dispatch. Recovery is a new
+    // caller attempt, not evidence that the original restart already occurred.
+    public void PrepareMsiApply() => PrepareMsiApply(journal, record);
+    public static void PrepareMsiApply(ITransactionJournal journal, TransactionRecord record)
+    {
+        ProtectedJournal.Validate(record);
+        if (record.Status != JournalStatus.Prepared || record.Steps.Count != 0)
+            throw new InvalidOperationException("MSI preparation requires new driver work.");
+        record.RestartAnchor ??= ""; // Legacy Prepared XML may omit the new member.
+        record.Schema = 2;
+        record.CommitRebootRequired |= record.Operation != Operation.Upgrade;
+        journal.Save(record);
+    }
+    public bool VerifyCommitRestart(string currentBootId)
+    {
+        ProtectedJournal.Validate(record);
+        if (record.Status != JournalStatus.Applied) throw new InvalidOperationException("Commit requires verified applied driver state.");
+        if (!BootIdentity.Valid(record.BootId)) throw new InvalidDataException("Commit requires recorded boot evidence.");
+        if (!BootIdentity.Stable(currentBootId)) throw new InvalidOperationException("A stable current boot identity is required.");
+        if (BootIdentity.Legacy(record.BootId) && string.IsNullOrEmpty(record.RestartAnchor))
+            record.CommitRebootRequired = true;
+        return !record.CommitRebootRequired || VerifyRestart(currentBootId);
+    }
     public static DriverSettings ExpectedAfterBinding(DriverSettings? before) => new()
     {
         Active = false, Inverse = before?.Inverse ?? false,
@@ -87,7 +149,7 @@ public sealed partial class DriverTransaction
             // for all classes before any device/package removal is considered.
         }
     }
-    public JournalStatus Apply()
+    public JournalStatus Apply(string currentBootId)
     {
         ProtectedJournal.Validate(record);
         if (record.Status != JournalStatus.Prepared || record.Steps.Count != 0)
@@ -99,6 +161,7 @@ public sealed partial class DriverTransaction
             throw new InvalidOperationException("Fresh installation requires empty driver ownership; migrate legacy first.");
         if (record.Operation != Operation.Install && !(Reconstructing ? state.Repairable : state.CoreHealthy))
             throw new InvalidOperationException("Existing resources are not healthy and proven; explicit recovery required.");
+        AnchorNewWork(currentBootId);
         record.Status = JournalStatus.Applying; journal.Save(record);
         try
         {
@@ -173,9 +236,10 @@ public sealed partial class DriverTransaction
         if (record.Status == JournalStatus.RollbackRebootRequired) return ResumeRollbackAfterReboot(currentBootId);
         if (record.Status != JournalStatus.RebootRequired || !record.Reboot ||
             record.RollbackDirection ||
-            !BootIdentity.Valid(record.BootId) || !BootIdentity.Valid(currentBootId) || currentBootId == record.BootId ||
+            !BootIdentity.Valid(record.BootId) || !BootIdentity.Stable(currentBootId) ||
             record.Steps.Any(x => !x.Completed || x.Undone))
             throw new InvalidOperationException("A verified new boot and completed driver-step prefix are required for resume.");
+        if (!VerifyRestart(currentBootId)) return record.Status;
         var state = backend.Inspect(); ValidateState(state);
         foreach (int index in Enumerable.Range(0, 3))
         {
@@ -212,7 +276,7 @@ public sealed partial class DriverTransaction
             throw new InvalidOperationException("Retained driver or baseline changed during reboot.");
 
         int previousSteps = record.Steps.Count;
-        record.Reboot = false; record.BootId = currentBootId; record.Status = JournalStatus.Applying; journal.Save(record);
+        record.Reboot = false; record.RestartAnchor = currentBootId; record.CommitRebootRequired = false; record.Status = JournalStatus.Applying; journal.Save(record);
         try
         {
             if (record.Operation == Operation.Uninstall)

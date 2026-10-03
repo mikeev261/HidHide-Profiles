@@ -83,10 +83,10 @@ public sealed class LegacyRecovery
         {
             // Even old journals lacking per-removal boot proof get a new durable
             // boot boundary. No original worker can survive this boundary.
-            if (record.Boot == host.Boot) return false;
+            if (!BootIdentity.Changed(record.Boot, host.Boot)) return false;
             Phase(LegacyRecoveryPhase.DriverPreparation);
         }
-        if (record.Phase == LegacyRecoveryPhase.Packages && (record.Boot == host.Boot || record.PackageAttemptBoot == host.Boot)) return false;
+        if (record.Phase == LegacyRecoveryPhase.Packages && (!BootIdentity.Changed(record.Boot, host.Boot) || record.PackageAttemptBoot.Length != 0 && !BootIdentity.Changed(record.PackageAttemptBoot, host.Boot))) return false;
         if (record.Phase != LegacyRecoveryPhase.Services)
         {
             record.ServiceQuiesceIntent = true; Save();
@@ -100,10 +100,10 @@ public sealed class LegacyRecovery
         var products = setup.Legacy.OrderBy(x => x.Family == ProductContract.UpstreamUpgradeCode ? 0 : 1).ToArray();
         if (record.Phase == LegacyRecoveryPhase.Packages)
         {
-            if (record.Boot == host.Boot) return false;
+            if (!BootIdentity.Changed(record.Boot, host.Boot)) return false;
             while (record.PackageIndex < products.Length)
             {
-                if (record.PackageAttemptBoot.Length != 0 && record.PackageAttemptBoot == host.Boot) return false;
+                if (record.PackageAttemptBoot.Length != 0 && !BootIdentity.Changed(record.PackageAttemptBoot, host.Boot)) return false;
                 VerifyInventory(setup, host.Detect());
                 var product = products[record.PackageIndex];
                 bool registered = host.Detect().Any(x => x.Product == product.Product);
@@ -118,7 +118,7 @@ public sealed class LegacyRecovery
                 // custom-action children and delayed driver work must be gone.
                 record.Boot = host.Boot; Save(); return false;
             }
-            if (record.Boot == host.Boot) return false;
+            if (!BootIdentity.Changed(record.Boot, host.Boot)) return false;
             Phase(LegacyRecoveryPhase.DriverVerification);
         }
         if (record.Phase == LegacyRecoveryPhase.DriverVerification)

@@ -89,7 +89,7 @@ public sealed partial class WindowsSetupHost : ISetupHost, ILegacyRecoveryHost, 
         {
             // A terminal failed Apply plus restored MSI/Burn state explicitly
             // authorizes conversion; old forward records are never inferred undo.
-            new DriverTransaction(Backend, journal, driver).Rollback();
+            new DriverTransaction(Backend, journal, driver).Rollback(BootIdentity.Current());
             return false;
         }
         if (driver.Status == JournalStatus.RollbackRebootRequired)

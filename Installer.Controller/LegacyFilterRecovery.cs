@@ -33,6 +33,6 @@ public static class LegacyFilterRecovery
             }
             recovery.FilterNext++; recovery.FilterIntent = false; save();
         }
-        return recovery.FilterBoot.Length == 0 || recovery.FilterBoot != boot;
+        return recovery.FilterBoot.Length == 0 || BootIdentity.Changed(recovery.FilterBoot, boot);
     }
 }

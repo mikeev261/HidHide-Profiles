@@ -107,7 +107,7 @@ public sealed class SetupTransaction
         if (record.Phase == SetupPhase.WaitingForReboot && record.ResumePhase == SetupPhase.RecoveryRequired)
         {
             if (!record.MsiFailureReported) throw new InvalidOperationException("Rollback reboot has no terminal MSI failure.");
-            if (record.Boot == host.Boot) return record.Phase;
+            if (!BootIdentity.Changed(record.Boot, host.Boot)) return record.Phase;
             Phase(SetupPhase.RecoveryRequired);
         }
         if (record.Phase == SetupPhase.RecoveryRequired && record.MsiFailureReported)
@@ -122,7 +122,7 @@ public sealed class SetupTransaction
         if (record.Phase == SetupPhase.Complete) { host.VerifyFinal(record); host.ClearMarker(record); return record.Phase; }
         if (record.Phase == SetupPhase.WaitingForReboot)
         {
-            if (record.Boot == host.Boot) return record.Phase;
+            if (!BootIdentity.Changed(record.Boot, host.Boot)) return record.Phase;
             if (record.ResumePhase == SetupPhase.MsiApplied && !host.ResumeDriver(record)) { Reboot(SetupPhase.MsiApplied); return record.Phase; }
             Phase(record.ResumePhase);
         }

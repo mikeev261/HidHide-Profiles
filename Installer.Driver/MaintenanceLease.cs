@@ -16,30 +16,22 @@ public sealed class MaintenanceLease : IDisposable
     readonly Mutex owner;
     bool owned;
     readonly Guid transaction;
+    readonly bool recovery;
     public MaintenanceLease(Guid transaction, bool recovery = false, bool createPreparation = false)
     {
-        ProtectedJournal.RequireAdministrator(); this.transaction = transaction;
+        ProtectedJournal.RequireAdministrator(); this.transaction = transaction; this.recovery = recovery;
         if (recovery || createPreparation)
         {
-            if (recovery)
-            {
-                _ = new ProtectedJournal(transaction).Load();
-                ValidateMarker(transaction);
-            }
-            else
-            {
-                using var machine = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64);
-                using var existing = machine.OpenSubKey(Marker);
-                if (existing != null)
-                    throw new InvalidOperationException("Another protected maintenance transaction is active.");
-            }
             var eventSecurity = new EventWaitHandleSecurity(); eventSecurity.SetAccessRuleProtection(true, false);
             eventSecurity.AddAccessRule(new EventWaitHandleAccessRule(new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null), EventWaitHandleRights.Synchronize, AccessControlType.Allow));
             foreach (var sid in new[] { WellKnownSidType.BuiltinAdministratorsSid, WellKnownSidType.LocalSystemSid })
                 eventSecurity.AddAccessRule(new EventWaitHandleAccessRule(new SecurityIdentifier(sid, null), EventWaitHandleRights.FullControl, AccessControlType.Allow));
             recoveryBarrier = new EventWaitHandle(false, EventResetMode.ManualReset, @"Global\HidHide.AppProfiles.Maintenance.v1", out bool created, eventSecurity);
             if (createPreparation && !created)
+            {
+                recoveryBarrier.Dispose();
                 throw new InvalidOperationException("Another ordinary-user maintenance preparation is active.");
+            }
             barrier = recoveryBarrier.SafeWaitHandle;
         }
         else barrier = OpenEventW(0x100000, false, @"Global\HidHide.AppProfiles.Maintenance.v1");
@@ -55,13 +47,28 @@ public sealed class MaintenanceLease : IDisposable
             acquired = new Mutex(false, @"Global\HidHide.AppProfiles.Coordinator.v1", out _, security);
             try { owned = acquired.WaitOne(5000); } catch (AbandonedMutexException) { owned = true; }
             if (!owned) throw new InvalidOperationException("Maintenance ownership handoff timed out.");
+            // Validate after waiting: the preceding owner may have committed
+            // and cleared its marker, or a different transaction may own it.
+            if (recovery)
+            {
+                ValidateMarker(transaction);
+                _ = new ProtectedJournal(transaction).Load();
+            }
+            else
+            {
+                using var machine = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64);
+                using var existing = machine.OpenSubKey(Marker);
+                if (existing != null) throw new InvalidOperationException("Another protected maintenance transaction is active.");
+            }
             owner = acquired;
         }
-        catch { acquired?.Dispose(); barrier.Dispose(); recoveryBarrier?.Dispose(); throw; }
+        catch { if (owned) { acquired!.ReleaseMutex(); owned = false; } acquired?.Dispose(); barrier.Dispose(); recoveryBarrier?.Dispose(); throw; }
     }
     public void MarkPending(bool rollback, string? operation = null, bool canRestoreLegacy = false, bool restartRequired = false)
     {
         AssertHeld();
+        // A recovery lease must never recreate a marker cleared by completion.
+        if (recovery) ValidateMarker(transaction);
         if (operation != null && operation is not ("install" or "repair" or "uninstall" or "upgrade"))
             throw new InvalidDataException("Invalid maintenance operation metadata.");
         using var machine = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64);
