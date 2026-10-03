@@ -16,8 +16,14 @@ namespace HidHide
     inline bool OwnedStartupCommand(std::optional<std::wstring> const& value,
         std::wstring const& currentCommand, std::wstring const& legacyCommand)
     {
-        return value && (0 == ::_wcsicmp(value->c_str(), currentCommand.c_str())
-            || 0 == ::_wcsicmp(value->c_str(), legacyCommand.c_str()));
+        // Compare the entire bounded registry value: a C-string comparison alone
+        // would accept an owned prefix followed by an embedded NUL and foreign data.
+        auto matches = [&](std::wstring const& command) {
+            return value && value->find(L'\0') == std::wstring::npos
+                && value->size() == command.size()
+                && 0 == ::_wcsicmp(value->c_str(), command.c_str());
+        };
+        return matches(currentCommand) || matches(legacyCommand);
     }
 
     inline StartupEntryPlan PlanStartupEntry(bool enabled,

@@ -1,11 +1,50 @@
 using HidHide.DriverSetup;
 using HidHide.Installer;
 using Microsoft.Win32;
+using System.Runtime.InteropServices;
 
 int checks = 0;
 void Check(bool value, string name) { if (!value) throw new Exception(name); checks++; }
 void Reject(Action action, string name) { bool threw = false; try { action(); } catch { threw = true; } Check(threw, name); }
 TransactionRecord Record(Fake backend, Operation operation) => new() { Id = Guid.NewGuid(), InitiatingSid = "S-1-5-21-1-2-3-1001", Operation = operation, BootId = "1", Before = backend.Inspect() };
+
+// Real Win32 sharing witness using the same opener as Inspect, never the driver.
+var sharingPath = Path.Combine(Path.GetTempPath(), "HidHide-sharing-" + Guid.NewGuid() + ".tmp");
+File.WriteAllText(sharingPath, "isolated sharing witness");
+try
+{
+    using (var existing = new FileStream(sharingPath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite))
+    {
+        using var inspection = ControlHandle.OpenInspection(sharingPath);
+        Check(!inspection.IsInvalid, "inspection shares with compatible read/write handle");
+        using var restoration = ControlHandle.OpenRestoration(sharingPath);
+        int error = Marshal.GetLastWin32Error();
+        Check(restoration.IsInvalid && error == 32, "exclusive restoration remains excluded by another handle");
+    }
+    using (var existing = new FileStream(sharingPath, FileMode.Open, FileAccess.Read, FileShare.None))
+    {
+        var started = System.Diagnostics.Stopwatch.StartNew();
+        bool refused = false;
+        try { using var inspection = ControlHandle.OpenInspection(sharingPath); }
+        catch (System.ComponentModel.Win32Exception error) { refused = error.NativeErrorCode == 32; }
+        Check(refused, "persistent sharing contention fails inspection instead of reporting absence");
+        Check(started.ElapsedMilliseconds >= 900 && started.ElapsedMilliseconds < 5000, "inspection contention retries are bounded");
+    }
+    var transient = new FileStream(sharingPath, FileMode.Open, FileAccess.Read, FileShare.None);
+    var release = System.Threading.Tasks.Task.Run(() => { System.Threading.Thread.Sleep(200); transient.Dispose(); });
+    try
+    {
+        using var inspection = ControlHandle.OpenInspection(sharingPath);
+        Check(!inspection.IsInvalid, "inspection succeeds after transient exclusive handle closes");
+    }
+    finally { release.GetAwaiter().GetResult(); transient.Dispose(); }
+    using (var restoration = ControlHandle.OpenRestoration(sharingPath))
+        Check(!restoration.IsInvalid, "exclusive restoration opens after conflicting handle closes");
+    using var missing = ControlHandle.OpenInspection(sharingPath + ".missing");
+    int missingError = Marshal.GetLastWin32Error();
+    Check(missing.IsInvalid && missingError == 2, "inspection preserves genuine absence");
+}
+finally { File.Delete(sharingPath); }
 
 var fresh = new Fake(); var journal = new MemoryJournal(); var record = Record(fresh, Operation.Install);
 var deleting = Fake.Healthy(); deleting.State.ServicePendingDeletion = true;
