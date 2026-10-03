@@ -1,10 +1,22 @@
 using HidHide.DriverSetup;
 using HidHide.Installer;
 using Microsoft.Win32;
+using System.Runtime.InteropServices;
 
 int checks = 0;
 void Check(bool value, string name) { if (!value) throw new Exception(name); checks++; }
 void Reject(Action action, string name) { bool threw = false; try { action(); } catch { threw = true; } Check(threw, name); }
+void RejectGuard<T>(Action action, string message, string name) where T : Exception
+{ bool matched = false; try { action(); } catch (T ex) { matched = ex.GetType() == typeof(T) && ex.Message == message; } Check(matched, name); }
+byte[] RecordBytes(TransactionRecord record) { using var bytes = new MemoryStream(); new System.Runtime.Serialization.DataContractSerializer(typeof(TransactionRecord)).WriteObject(bytes, record); return bytes.ToArray(); }
+void RejectUnchanged<T>(Action action, string message, string name, Fake backend, SnapshotJournal journal, TransactionRecord record) where T : Exception
+{
+    var state = ProtectedJournal.StateBytes(backend.Inspect()); var evidence = RecordBytes(record); var durable = journal.Bytes;
+    int calls = backend.Calls.Count, writes = journal.Writes;
+    RejectGuard<T>(action, message, name);
+    Check(backend.Calls.Count == calls && journal.Writes == writes && ProtectedJournal.StateBytes(backend.Inspect()).SequenceEqual(state) &&
+        RecordBytes(record).SequenceEqual(evidence) && journal.Bytes.SequenceEqual(durable), name + " preserves complete backend and durable evidence");
+}
 TransactionRecord Record(Fake backend, Operation operation) => new() { Id = Guid.NewGuid(), InitiatingSid = "S-1-5-21-1-2-3-1001", Operation = operation, BootId = "winboot-v1:1", Before = backend.Inspect() };
 
 // Read-only provider smoke is opt-in and never opens the driver or journals.
@@ -72,10 +84,10 @@ foreach (bool rollback in new[] { false, true })
 }
 foreach (JournalStatus rejectedStatus in new[] { JournalStatus.Applying, JournalStatus.RecoveryRequired, JournalStatus.Committed })
 {
-    var b = new Fake(); var r = Record(b, Operation.Install); r.Status = rejectedStatus;
-    var j = new MemoryJournal(); var t = new DriverTransaction(b, j, r);
-    Reject(() => t.Apply("winboot-v1:99"), "rejected apply cannot rewrite anchor: " + rejectedStatus);
-    Check(r.RestartAnchor == "" && j.Writes == 0 && b.Calls.Count == 0, "rejected apply retains all recovery evidence");
+    var b = new Fake(); var r = Record(b, Operation.Install); r.Status = rejectedStatus; r.RestartAnchor = "winboot-v1:1";
+    ProtectedJournal.Validate(r); var j = new SnapshotJournal(); j.Save(r); var t = new DriverTransaction(b, j, r);
+    RejectUnchanged<InvalidOperationException>(() => t.Apply("winboot-v1:99"), "Transaction is not new; explicit recovery/re-detection required.",
+        "non-new Apply status guard: " + rejectedStatus, b, j, r);
 }
 {
     var r = Record(new Fake(), Operation.Install); r.Schema = 1;
@@ -108,10 +120,10 @@ foreach (var op in new[] { Operation.Repair, Operation.Upgrade })
 }
 foreach (string missing in new[] { "", "winboot-v1:01", "garbage" })
 {
-    var b = Fake.Healthy(); var r = Record(b, Operation.Upgrade); r.Status = JournalStatus.Applied; r.BootId = missing;
-    var j = new MemoryJournal();
-    Reject(() => new DriverTransaction(b, j, r).VerifyCommitRestart("winboot-v1:7"), "missing/malformed saved evidence cannot commit: " + missing);
-    Check(j.Writes == 0 && b.Calls.Count == 0, "invalid commit evidence preserved without writes");
+    var b = Fake.Healthy(); var r = Record(b, Operation.Upgrade); var j = new SnapshotJournal(); var t = new DriverTransaction(b, j, r);
+    t.Apply("winboot-v1:1"); r.BootId = missing;
+    RejectUnchanged<InvalidDataException>(() => t.VerifyCommitRestart("winboot-v1:7"), missing == "" ? "Missing recorded boot evidence for driver work." : "Invalid boot identity.",
+        "missing/malformed saved evidence cannot commit: " + missing, b, j, r);
 }
 {
     var b = Fake.Healthy(); var r = Record(b, Operation.Repair); r.BootId = "";
@@ -229,6 +241,44 @@ foreach (string phase in new[] { "worker", "finalization", "rollback" })
         "queued finalizer does not erase or move legacy evidence");
 }
 
+// Real Win32 sharing witness using the same opener as Inspect, never the driver.
+var sharingPath = Path.Combine(Path.GetTempPath(), "HidHide-sharing-" + Guid.NewGuid() + ".tmp");
+File.WriteAllText(sharingPath, "isolated sharing witness");
+try
+{
+    using (var existing = new FileStream(sharingPath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite))
+    {
+        using var inspection = ControlHandle.OpenInspection(sharingPath);
+        Check(!inspection.IsInvalid, "inspection shares with compatible read/write handle");
+        using var restoration = ControlHandle.OpenRestoration(sharingPath);
+        int error = Marshal.GetLastWin32Error();
+        Check(restoration.IsInvalid && error == 32, "exclusive restoration remains excluded by another handle");
+    }
+    using (var existing = new FileStream(sharingPath, FileMode.Open, FileAccess.Read, FileShare.None))
+    {
+        var started = System.Diagnostics.Stopwatch.StartNew();
+        bool refused = false;
+        try { using var inspection = ControlHandle.OpenInspection(sharingPath); }
+        catch (System.ComponentModel.Win32Exception error) { refused = error.NativeErrorCode == 32; }
+        Check(refused, "persistent sharing contention fails inspection instead of reporting absence");
+        Check(started.ElapsedMilliseconds >= 900 && started.ElapsedMilliseconds < 5000, "inspection contention retries are bounded");
+    }
+    var transient = new FileStream(sharingPath, FileMode.Open, FileAccess.Read, FileShare.None);
+    var release = System.Threading.Tasks.Task.Run(() => { System.Threading.Thread.Sleep(200); transient.Dispose(); });
+    try
+    {
+        using var inspection = ControlHandle.OpenInspection(sharingPath);
+        Check(!inspection.IsInvalid, "inspection succeeds after transient exclusive handle closes");
+    }
+    finally { release.GetAwaiter().GetResult(); transient.Dispose(); }
+    using (var restoration = ControlHandle.OpenRestoration(sharingPath))
+        Check(!restoration.IsInvalid, "exclusive restoration opens after conflicting handle closes");
+    using var missing = ControlHandle.OpenInspection(sharingPath + ".missing");
+    int missingError = Marshal.GetLastWin32Error();
+    Check(missing.IsInvalid && missingError == 2, "inspection preserves genuine absence");
+}
+finally { File.Delete(sharingPath); }
+
 var fresh = new Fake(); var journal = new MemoryJournal(); var record = Record(fresh, Operation.Install);
 var deleting = Fake.Healthy(); deleting.State.ServicePendingDeletion = true;
 Check(!deleting.State.CoreHealthy && !deleting.State.CanInstall, "Pending deletion is observable but never a healthy/fresh driver");
@@ -287,7 +337,8 @@ foreach (string missing in new[] { "node", "package", "service", "binary", "cont
     values["Active"] = (RegistryValueKind.String, "winboot-v1:1"); Reject(() => ReadStored(), "stored flag type rejected");
     values["Active"] = (RegistryValueKind.DWord, 2); Reject(() => ReadStored(), "stored flag value rejected");
     values["Active"] = (RegistryValueKind.DWord, 1); values["WhitelistedFullImageNames"] = (RegistryValueKind.MultiString, new[] { "same", "same" }); Reject(() => ReadStored(), "stored duplicate list rejected");
-    values.Remove("BlacklistedDeviceInstancePaths"); Reject(() => ReadStored(), "missing stored baseline list rejected");
+    values["WhitelistedFullImageNames"] = (RegistryValueKind.MultiString, new[] { "feeder" });
+    values.Remove("BlacklistedDeviceInstancePaths"); RejectGuard<InvalidDataException>(() => ReadStored(), "Invalid stored driver list.", "missing stored baseline list rejected");
 }
 var uninstall = Fake.Healthy(); var removal = Record(uninstall, Operation.Uninstall);
 Check(new DriverTransaction(uninstall, new MemoryJournal(), removal).Apply("winboot-v1:1") == JournalStatus.RebootRequired, "Uninstall filter changes report reboot");
@@ -323,8 +374,18 @@ var changed = new Fake(); var stale = Record(changed, Operation.Install); change
 Reject(() => new DriverTransaction(changed, new MemoryJournal(), stale).Apply("winboot-v1:1"), "Changed snapshot rejected");
 Check(changed.Calls.Count == 0, "Stale preparation did not mutate");
 var failJournal = new Fake();
-Reject(() => new DriverTransaction(failJournal, new MemoryJournal { FailWrite = 2 }, Record(failJournal, Operation.Install)).Apply("winboot-v1:1"), "Intent write failure rejects action");
-Check(failJournal.Calls.Count == 0, "No mutation before durable intent");
+var intentRecord = Record(failJournal, Operation.Install); var intentJournal = new SnapshotJournal { RejectStageIntent = true };
+var intentState = ProtectedJournal.StateBytes(failJournal.Inspect());
+RejectGuard<IOException>(() => new DriverTransaction(failJournal, intentJournal, intentRecord).Apply("winboot-v1:1"), "injected Stage intent flush failure", "Stage intent write failure rejects action");
+var intentCheckpoint = intentJournal.Load();
+Check(intentCheckpoint.Status == JournalStatus.RecoveryRequired && intentCheckpoint.Steps.Count == 1 && intentCheckpoint.Steps[0].Kind == StepKind.Stage &&
+    !intentCheckpoint.Steps[0].Completed && intentCheckpoint.RestartAnchor == "winboot-v1:1" && intentJournal.StageIntentFailures == 1,
+    "failed Stage intent leaves explicit incomplete recovery checkpoint");
+Check(failJournal.Calls.Count == 0 && ProtectedJournal.StateBytes(failJournal.Inspect()).SequenceEqual(intentState), "No mutation before durable Stage intent");
+var statusBackend = new Fake(); var statusRecord = Record(statusBackend, Operation.Install); var statusJournal = new MemoryJournal { FailWrite = 2 };
+RejectGuard<IOException>(() => new DriverTransaction(statusBackend, statusJournal, statusRecord).Apply("winboot-v1:1"), "injected journal failure", "Applying status persistence interruption propagates");
+Check(statusRecord.Status == JournalStatus.Applying && statusRecord.Steps.Count == 0 && statusJournal.Writes == 2 && statusBackend.Calls.Count == 0,
+    "status persistence interruption occurs before native intent");
 
 // Known completed creation can be rolled back in reverse order. Unlike a
 // failed/ambiguous native call, ownership and exact filter states are recorded.
@@ -339,8 +400,8 @@ Check(undo.State.Empty && undo.Calls.Skip(undo.Calls.Count - 2).SequenceEqual(ne
 
 var invalid = Record(new Fake(), Operation.Install); invalid.Schema = 99;
 Reject(() => ProtectedJournal.Validate(invalid), "Unknown journal schema rejected");
-invalid.Schema = 1; invalid.PayloadIdentity = new string('0', 64);
-Reject(() => ProtectedJournal.Validate(invalid), "Foreign payload journal rejected");
+invalid.Schema = 2; invalid.PayloadIdentity = new string('0', 64);
+RejectGuard<InvalidDataException>(() => ProtectedJournal.Validate(invalid), "Unsupported maintenance journal.", "Foreign payload journal rejected");
 foreach (var text in new[] { "HidHide.inf", "../oem1.inf", "C:\\Windows\\INF\\oem1.inf", "oem1.inf.bak", "oem1.inf\n", "oem*.inf" })
  Reject(() => Payload.PublishedInf(text), "Unsafe package selector rejected");
 Check(Payload.PublishedInf("oem34.inf") == "oem34.inf", "Exact package identity accepted");
@@ -388,10 +449,17 @@ Check(resumedEngine.ResumeAfterReboot("winboot-v1:2") == JournalStatus.RebootReq
 Check(resumed.Calls.Count(x=>x=="stage")==1 && resumed.Calls.Count(x=>x=="create")==1 && resumed.Calls.Count(x=>x=="bind")==1, "Resume never repeats completed driver steps");
 Check(resumedEngine.ResumeAfterReboot("winboot-v1:3") == JournalStatus.Applied, "Second boot verifies completed installation");
 Reject(() => resumedEngine.ResumeAfterReboot("winboot-v1:4"), "Applied transaction cannot replay resume");
-var externalResume=Fake.Healthy(); var externalRecord=Record(externalResume, Operation.Repair);
-externalRecord.BootId="winboot-v1:1"; externalRecord.Status=JournalStatus.RebootRequired; externalRecord.Reboot=true;
+var externalResume=Fake.Healthy(); externalResume.State.Filters[1].Entries = new[] { "VendorA", "VendorB" };
+var externalRecord=Record(externalResume, Operation.Repair); var externalJournal=new MemoryJournal();
+var externalEngine=new DriverTransaction(externalResume,externalJournal,externalRecord);
+Check(externalEngine.Apply("winboot-v1:1") == JournalStatus.RebootRequired && externalRecord.RestartAnchor == "winboot-v1:1", "Baseline-change witness has production-generated restart evidence");
 externalResume.State.Settings=CopySettings(externalResume.State.Settings!); externalResume.State.Settings.Active=false;
-Reject(() => new DriverTransaction(externalResume,new MemoryJournal(),externalRecord).ResumeAfterReboot("winboot-v1:2"), "External baseline edit during reboot blocks resume");
+var externalState=ProtectedJournal.StateBytes(externalResume.Inspect()); int externalCalls=externalResume.Calls.Count, externalWrites=externalJournal.Writes;
+bool baselineRejected=false;
+try { externalEngine.ResumeAfterReboot("winboot-v1:2"); }
+catch (InvalidOperationException ex) { baselineRejected=ex.Message == "Retained driver or baseline changed during reboot."; }
+Check(baselineRejected, "External baseline edit during reboot reaches baseline-change guard");
+Check(externalResume.Calls.Count == externalCalls && externalJournal.Writes == externalWrites && ProtectedJournal.StateBytes(externalResume.Inspect()).SequenceEqual(externalState), "Baseline-change refusal preserves backend settings and journal without mutation");
 var removeResume=Fake.Healthy(); removeResume.RebootAt="remove-node"; var removeRecord=Record(removeResume,Operation.Uninstall); removeRecord.BootId="winboot-v1:1";
 var removeEngine=new DriverTransaction(removeResume,new MemoryJournal(),removeRecord);
 Check(removeEngine.Apply("winboot-v1:1")==JournalStatus.RebootRequired, "Node removal requests reboot");
@@ -454,8 +522,10 @@ rollbackRepairEngine.Apply("winboot-v1:1"); rollbackRepairEngine.Rollback("winbo
 Check(rollbackRepairEngine.ResumeAfterReboot("winboot-v1:2") == JournalStatus.RollbackRebootRequired, "retained filter repair undo requires restart");
 Check(rollbackRepairEngine.ResumeAfterReboot("winboot-v1:3") == JournalStatus.RolledBack && rollbackRepair.State.Settings!.Active, "retained driver baseline survives filter rollback");
 Check(rollbackRepair.Calls.All(x => x == "filter1"), "filter repair rollback never deletes retained driver");
-var historical = Record(new Fake(), Operation.Install); historical.Status = JournalStatus.RollingBack;
-Reject(() => new DriverTransaction(new Fake(), new MemoryJournal(), historical).Rollback("winboot-v1:1"), "old interrupted rollback has no inferred direction");
+var historicalBackend = new Fake(); var historical = Record(historicalBackend, Operation.Install); historical.Status = JournalStatus.RollingBack; historical.RestartAnchor = "winboot-v1:1";
+ProtectedJournal.Validate(historical); var historicalJournal = new SnapshotJournal(); historicalJournal.Save(historical);
+RejectUnchanged<InvalidOperationException>(() => new DriverTransaction(historicalBackend, historicalJournal, historical).Rollback("winboot-v1:1"),
+    "Cannot begin rollback from this transaction state.", "old interrupted rollback has no inferred direction", historicalBackend, historicalJournal, historical);
 historical.Status = JournalStatus.RollbackRebootRequired; historical.Reboot = true;
 Reject(() => ProtectedJournal.Validate(historical), "rollback status requires explicit direction");
 // Simulate power loss after the native inverse call but before its completion
@@ -484,8 +554,12 @@ sealed class FixtureLease : IDisposable {
  public void Dispose() => release();
 }
 sealed class SnapshotJournal : ITransactionJournal {
- public bool RejectUndoCompletion; byte[] saved = Array.Empty<byte>();
+ public bool RejectUndoCompletion, RejectStageIntent; public int Writes, StageIntentFailures; byte[] saved = Array.Empty<byte>();
+ public byte[] Bytes => saved.ToArray();
  public void Save(TransactionRecord record) {
+  Writes++;
+  if (RejectStageIntent && StageIntentFailures == 0 && record.Status == JournalStatus.Applying && record.Steps.Count == 1 && record.Steps[0].Kind == StepKind.Stage && !record.Steps[0].Completed)
+  { StageIntentFailures++; throw new IOException("injected Stage intent flush failure"); }
   if (RejectUndoCompletion && record.Steps.Any(x => x.Undone)) throw new IOException("injected completion flush failure");
   ProtectedJournal.Validate(record); using var stream = new MemoryStream();
   new System.Runtime.Serialization.DataContractSerializer(typeof(TransactionRecord)).WriteObject(stream, record); saved = stream.ToArray();

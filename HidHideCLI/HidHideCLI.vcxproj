@@ -348,6 +348,7 @@
     <ClInclude Include="src\DeviceSelection.h" />
     <ClInclude Include="resource.h" />
     <ClInclude Include="src\CommandInterpreter.h" />
+    <ClInclude Include="src\CliDispatch.h" />
     <ClInclude Include="src\Commands.h" />
     <ClInclude Include="src\FilterDriverProxy.h" />
     <ClInclude Include="src\HID.h" />

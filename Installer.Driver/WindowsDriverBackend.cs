@@ -113,7 +113,7 @@ public sealed class WindowsDriverBackend : IDriverBackend
                 throw new InvalidDataException("Unexpected HidHide service configuration.");
         }
         var binary = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "drivers", "HidHide.sys");
-        using var control = CreateFileW(@"\\.\HidHide", 0x80000000, 0, IntPtr.Zero, 3, 0, IntPtr.Zero);
+        using var control = ControlHandle.OpenInspection(@"\\.\HidHide");
         return new DriverState {
             Nodes = nodes.OrderBy(x => x.Id, StringComparer.OrdinalIgnoreCase).ToArray(),
             Packages = packages.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray(),
@@ -153,7 +153,7 @@ public sealed class WindowsDriverBackend : IDriverBackend
     {
         Guard();
         if (!Inspect().CoreHealthy) throw new InvalidOperationException("Cannot restore settings to an unverified driver.");
-        using var control = CreateFileW(@"\\.\HidHide", 0x80000000, 0, IntPtr.Zero, 3, 0, IntPtr.Zero);
+        using var control = ControlHandle.OpenRestoration(@"\\.\HidHide");
         if (control.IsInvalid) throw Error("Acquire exclusive baseline restoration handle");
         SettingsRestoration.Apply(expected, desired, () => ReadSettings(control), (field, bytes) =>
         {
@@ -268,7 +268,6 @@ public sealed class WindowsDriverBackend : IDriverBackend
     [DllImport("newdev.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)] static extern bool UpdateDriverForPlugAndPlayDevicesW(IntPtr parent, string hardwareId, string inf, uint flags, out bool reboot);
     [DllImport("newdev.dll", SetLastError = true)] static extern bool DiUninstallDevice(IntPtr parent, IntPtr set, ref DeviceData data, uint flags, out bool reboot);
     [DllImport("newdev.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)] static extern bool DiUninstallDriverW(IntPtr parent, string inf, uint flags, out bool reboot);
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)] static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool DeviceIoControl(SafeFileHandle handle, uint code, IntPtr input, uint inputSize, byte[]? output, uint outputSize, out uint used, IntPtr overlap);
     [DllImport("kernel32.dll", EntryPoint = "DeviceIoControl", SetLastError = true)] static extern bool WriteDeviceIoControl(SafeFileHandle handle, uint code, byte[] input, uint inputSize, IntPtr output, uint outputSize, out uint used, IntPtr overlap);
 }
