@@ -62,7 +62,7 @@ public:
     void Tick();
     bool AcceptanceScanNow();
     bool ReloadRepositoryIfChanged();
-    void SetNotificationWindow(HWND window, UINT message) { std::lock_guard<std::mutex> lock(m_WorkerMutex); m_NotifyWindow = window; m_NotifyMessage = message; }
+    void SetNotificationWindow(HWND window, UINT message);
     void ExitSafely();
     std::set<std::filesystem::path> AdoptExternalState();
     ApplyOutcome CompleteAdoptionWithoutSettingsChange(std::set<std::filesystem::path> const& observedAllowedApplications);
@@ -77,6 +77,7 @@ private:
     void WorkerMain() noexcept;
     void RepositoryWatcherMain() noexcept;
     void SubmitSnapshot();
+    void ScheduleReconcileRetry(bool pending);
     ApplyOutcome Reconcile(HidHide::Profiles::Selection const& selection, bool saved, HidHide::Profiles::SavedVersion version = {});
     void SetVerifiedSelection(HidHide::Profiles::Selection const& selection);
     static HidHide::Profiles::DesiredEnforcement Desired(HidHide::Profiles::Snapshot const& snapshot, HidHide::Profiles::Selection const& selection);
@@ -108,6 +109,8 @@ private:
     std::uint64_t m_SubmittedRevision{};
     std::uint64_t m_CompletedSequence{};
     std::uint64_t m_AppliedSequence{};
+    bool m_ReconcileRetryPending{};
+    std::chrono::steady_clock::time_point m_ReconcileRetryAt{};
     ScanResult m_Completed;
     std::optional<HidHide::Profiles::Selection> m_LastPublishedSelection;
     bool m_LastPublishedComplete{};

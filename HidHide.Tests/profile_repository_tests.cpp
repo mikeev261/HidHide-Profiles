@@ -655,6 +655,28 @@ TEST(ProfileEnforcement, ProductionAdapterConformanceCasDedupReadbackAndPartialF
     ASSERT_TRUE(::SetEvent(command)); worker.WaitAndVerifyExit(); ::CloseHandle(ready); ::CloseHandle(command); ::CloseHandle(completed);
 }
 
+TEST(ProfileAcceptance, CoordinatorWatcherAndBoundedRetryNotifications)
+{
+    for (auto phase : { L"coordinator-late-registration", L"coordinator-parent-replacement", L"coordinator-watcher", L"coordinator-retry", L"coordinator-conflict", L"coordinator-maintenance", L"coordinator-incomplete", L"coordinator-missing" })
+    {
+        SCOPED_TRACE(Json::ToUtf8(phase));
+        TempDirectory temp; temp.path = temp.path.parent_path() / (L"HidHide-Profiles-Restart-Test-" + NewStableId());
+        auto token = NewStableId(); auto readyName = L"Local\\HidHide.Coordinator.Ready." + token;
+        auto commandName = L"Local\\HidHide.Coordinator.Command." + token; auto completedName = L"Local\\HidHide.Coordinator.Completed." + token;
+        HANDLE ready = ::CreateEventW(nullptr, TRUE, FALSE, readyName.c_str());
+        HANDLE command = ::CreateEventW(nullptr, TRUE, FALSE, commandName.c_str());
+        HANDLE completed = ::CreateEventW(nullptr, TRUE, FALSE, completedName.c_str()); ASSERT_TRUE(ready && command && completed);
+        auto worker = StartRestartWorker(phase, temp.path, readyName, commandName, completedName);
+        auto wait = ::WaitForSingleObject(completed, 15000);
+        std::string diagnostic;
+        if (std::filesystem::exists(temp.path / L".acceptance-error.txt")) diagnostic = ReadBytes(temp.path / L".acceptance-error.txt");
+        EXPECT_EQ(WAIT_OBJECT_0, wait) << diagnostic;
+        EXPECT_EQ(WAIT_OBJECT_0, ::WaitForSingleObject(ready, 0)) << diagnostic;
+        ::SetEvent(command); worker.WaitAndVerifyExit();
+        ::CloseHandle(ready); ::CloseHandle(command); ::CloseHandle(completed);
+    }
+}
+
 TEST(ProfileAcceptance, ValidatedRestoreImmediatelyClearsRepositoryBlockAndApplies)
 {
     TempDirectory temp; temp.path = std::filesystem::path(temp.path.parent_path()) / (L"HidHide-Profiles-Restart-Test-" + NewStableId());
