@@ -39,7 +39,7 @@ namespace HidHide::Profiles
         bool Relevant(ProcessObservation const& observation) const
         {
             return observation.processId && observation.lifetimeIdentity && observation.pathAccessible
-                && !observation.verifiedPath.empty() && m_Paths.count(NormalizeExecutable(observation.verifiedPath));
+                && !observation.verifiedPath.empty() && m_Paths.count(NormalizeObservedExecutable(observation.verifiedPath));
         }
         bool Contains(DWORD pid, std::uint64_t lifetime) const { return m_Live.count({pid, lifetime}) != 0; }
         // Takes ownership whether accepted, redundant, or irrelevant.
@@ -51,7 +51,7 @@ namespace HidHide::Profiles
         void RememberExit(ProcessObservation const& observation)
         {
             if (!Relevant(observation) || !observation.exitedAt) return;
-            auto& intervals = m_Exited[NormalizeExecutable(observation.verifiedPath)];
+            auto& intervals = m_Exited[NormalizeObservedExecutable(observation.verifiedPath)];
             auto start = observation.lifetimeIdentity, end = observation.exitedAt;
             auto it = intervals.lower_bound(start);
             if (it != intervals.begin()) { auto previous = std::prev(it); if (previous->second >= start) it = previous; }

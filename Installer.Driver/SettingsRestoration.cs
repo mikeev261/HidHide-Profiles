@@ -51,8 +51,10 @@ public static class SettingsRestoration
     {
         SettingsCodec.Validate(expected); SettingsCodec.Validate(desired);
         var actual = read();
-        if (!actual.Same(expected)) throw new InvalidOperationException("Settings changed before baseline restoration.");
+        // Already restored (for example by an earlier attempt that failed before
+        // it could commit): nothing to write, and retrying must not fail.
         if (actual.Same(desired)) return;
+        if (!actual.Same(expected)) throw new InvalidOperationException("Settings changed before baseline restoration.");
         if (actual.Active) write(SettingsField.Active, new byte[] { 0 });
         if (!SettingsCodec.Decode(actual.Whitelist).SequenceEqual(SettingsCodec.Decode(desired.Whitelist))) write(SettingsField.Whitelist, desired.Whitelist);
         if (!SettingsCodec.Decode(actual.Blacklist).SequenceEqual(SettingsCodec.Decode(desired.Blacklist))) write(SettingsField.Blacklist, desired.Blacklist);

@@ -5,6 +5,7 @@
 #include "ProfileRecovery.h"
 #include "ProfileProcessLifetime.h"
 #include "FilterDriverProxy.h"
+#include "Volume.h"
 #include <future>
 #include <iostream>
 
@@ -426,6 +427,9 @@ TEST(ProfileRepository, SameRevisionContentChangesRepositoryGeneration)
 
 TEST(ProfileRepository, RecoveryRejectsCorruptIntentBackupAndCommitMarker)
 {
+    // Transaction records are published atomically, so a crash can no longer
+    // tear them (see the *PartiallyWritten boundaries). The corruption below
+    // is injected after targets were replaced and must still be refused.
     TempDirectory temp; ProfileRepository repository(temp.path); auto loaded = repository.OpenOrCreate(); auto id = loaded.snapshot.settings.selectedGlobalId;
     auto version = repository.Version(id); auto draft = loaded.snapshot.profiles.at(id); draft.name = L"Changed";
     auto settings = loaded.snapshot.settings; settings.mode = Mode::UseGlobal;
@@ -472,9 +476,10 @@ TEST(ProfileRepository, CreateUpdateDeleteRecoverAsCompleteOldOrNewAtEveryBounda
     struct Injection { CommitBoundary boundary; std::size_t index; };
     std::vector<Injection> createOrUpdate{ { CommitBoundary::TempFlushed, 0 }, { CommitBoundary::TempFlushed, 1 },
         { CommitBoundary::IntentFlushed, 0 }, { CommitBoundary::TargetReplaced, 0 }, { CommitBoundary::TargetReplaced, 1 }, { CommitBoundary::SetVerified, 0 },
-        { CommitBoundary::CommitMarked, 0 }, { CommitBoundary::Completed, 0 } };
+        { CommitBoundary::CommitMarked, 0 }, { CommitBoundary::Completed, 0 }, { CommitBoundary::IntentPartiallyWritten, 0 }, { CommitBoundary::CommitMarkPartiallyWritten, 0 } };
     std::vector<Injection> deleting{ { CommitBoundary::TempFlushed, 1 }, { CommitBoundary::IntentFlushed, 0 },
-        { CommitBoundary::TargetReplaced, 0 }, { CommitBoundary::TargetReplaced, 1 }, { CommitBoundary::SetVerified, 0 }, { CommitBoundary::CommitMarked, 0 }, { CommitBoundary::Completed, 0 } };
+        { CommitBoundary::TargetReplaced, 0 }, { CommitBoundary::TargetReplaced, 1 }, { CommitBoundary::SetVerified, 0 }, { CommitBoundary::CommitMarked, 0 }, { CommitBoundary::Completed, 0 },
+        { CommitBoundary::IntentPartiallyWritten, 0 }, { CommitBoundary::CommitMarkPartiallyWritten, 0 } };
     for (auto operation : { Operation::Create, Operation::Update, Operation::Delete })
     {
         auto const& injections = operation == Operation::Delete ? deleting : createOrUpdate;
@@ -598,6 +603,43 @@ TEST(ProfileAcceptance, UnknownFreshObservationCreatesNoAuthoritativeCatalog)
     }
 }
 
+// Stale driver recovery evidence (for example a legacy companion transaction)
+// on a machine without a catalog must not lock the engine: the catalog cannot
+// be seeded from a conflicting observation, so explicit adoption has to be
+// possible while the catalog is uninitialized, and then seed it.
+TEST(ProfileAcceptance, FreshConflictCanBeAdoptedAndSeedsTheCatalog)
+{
+    TempDirectory temp; temp.path = std::filesystem::path(temp.path.parent_path()) / (L"HidHide-Profiles-Restart-Test-" + NewStableId());
+    auto token = NewStableId(); auto readyName = L"Local\\HidHide.FreshConflict.Ready." + token;
+    auto commandName = L"Local\\HidHide.FreshConflict.Command." + token; auto completedName = L"Local\\HidHide.FreshConflict.Completed." + token;
+    HANDLE ready = ::CreateEventW(nullptr, TRUE, FALSE, readyName.c_str()); HANDLE command = ::CreateEventW(nullptr, TRUE, FALSE, commandName.c_str());
+    HANDLE completed = ::CreateEventW(nullptr, TRUE, FALSE, completedName.c_str()); ASSERT_TRUE(ready && command && completed);
+    auto worker = StartRestartWorker(L"conflict-fresh-adopt", temp.path, readyName, commandName, completedName);
+    // A failing worker signals only completion and leaves its reason behind.
+    ASSERT_EQ(WAIT_OBJECT_0, ::WaitForSingleObject(completed, 10000)); std::string failure; std::error_code ignored;
+    if (std::filesystem::exists(temp.path / L".acceptance-error.txt", ignored)) failure = ReadBytes(temp.path / L".acceptance-error.txt");
+    ASSERT_TRUE(failure.empty()) << failure; ASSERT_EQ(WAIT_OBJECT_0, ::WaitForSingleObject(ready, 0));
+    ASSERT_TRUE(::SetEvent(command)); worker.WaitAndVerifyExit();
+    auto loaded = ProfileRepository(temp.path).Load(); EXPECT_TRUE(loaded.issues.empty());
+    EXPECT_EQ(1u, loaded.snapshot.profiles.size()); EXPECT_EQ(1u, loaded.snapshot.settings.allowedApplications.size());
+    ::CloseHandle(ready); ::CloseHandle(command); ::CloseHandle(completed);
+}
+
+TEST(ProfileAcceptance, IncompleteCatalogConflictIsNotSeededByAdoption)
+{
+    TempDirectory temp; temp.path = std::filesystem::path(temp.path.parent_path()) / (L"HidHide-Profiles-Restart-Test-" + NewStableId());
+    ProfileRepository setup(temp.path); setup.OpenOrCreate(); std::filesystem::remove(temp.path / L"settings.json");
+    auto before = AllRepositoryFileBytes(temp.path); ASSERT_EQ(1u, before.size());
+    auto token = NewStableId(); auto readyName = L"Local\\HidHide.IncompleteConflict.Ready." + token;
+    auto commandName = L"Local\\HidHide.IncompleteConflict.Command." + token; auto completedName = L"Local\\HidHide.IncompleteConflict.Completed." + token;
+    HANDLE ready = ::CreateEventW(nullptr, TRUE, FALSE, readyName.c_str()); HANDLE command = ::CreateEventW(nullptr, TRUE, FALSE, commandName.c_str());
+    HANDLE completed = ::CreateEventW(nullptr, TRUE, FALSE, completedName.c_str()); ASSERT_TRUE(ready && command && completed);
+    auto worker = StartRestartWorker(L"conflict-incomplete", temp.path, readyName, commandName, completedName);
+    ASSERT_EQ(WAIT_OBJECT_0, ::WaitForSingleObject(ready, 10000)); ASSERT_EQ(WAIT_OBJECT_0, ::WaitForSingleObject(completed, 10000));
+    EXPECT_EQ(before, AllRepositoryFileBytes(temp.path)); ASSERT_TRUE(::SetEvent(command)); worker.WaitAndVerifyExit();
+    EXPECT_EQ(before, AllRepositoryFileBytes(temp.path)); ::CloseHandle(ready); ::CloseHandle(command); ::CloseHandle(completed);
+}
+
 TEST(ProfileAcceptance, HardRecoveryFailuresBlockServiceAndPreserveAllEvidence)
 {
     for (int scenario : { 0, 1, 2 })
@@ -691,6 +733,40 @@ TEST(ProfileAcceptance, ValidatedRestoreImmediatelyClearsRepositoryBlockAndAppli
     std::error_code ignored; std::filesystem::remove_all(backup, ignored);
 }
 
+TEST(ProfileAcceptance, RepositoryRepairRechecksExternalAllowedAppsBeforeApplying)
+{
+    for (auto phase : { L"repaired-allowed-reload", L"repaired-allowed-restore" })
+    {
+        SCOPED_TRACE(Json::ToUtf8(phase));
+        TempDirectory temp; temp.path = std::filesystem::path(temp.path.parent_path()) / (L"HidHide-Profiles-Restart-Test-" + NewStableId());
+        ProfileRepository repository(temp.path); repository.OpenOrCreate(); auto backup = std::filesystem::path(temp.path.native() + L"-backup"); repository.Backup(backup);
+        auto settings = temp.path / L"settings.json"; std::ofstream corrupt(settings, std::ios::binary | std::ios::trunc); corrupt << "{"; corrupt.close();
+        auto token = NewStableId(); auto readyName = L"Local\\HidHide.Repair.Ready." + token; auto commandName = L"Local\\HidHide.Repair.Command." + token;
+        auto completedName = L"Local\\HidHide.Repair.Completed." + token; HANDLE ready = ::CreateEventW(nullptr, TRUE, FALSE, readyName.c_str());
+        HANDLE command = ::CreateEventW(nullptr, TRUE, FALSE, commandName.c_str()); HANDLE completed = ::CreateEventW(nullptr, TRUE, FALSE, completedName.c_str()); ASSERT_TRUE(ready && command && completed);
+        auto worker = StartRestartWorker(phase, temp.path, readyName, commandName, completedName);
+        EXPECT_EQ(WAIT_OBJECT_0, ::WaitForSingleObject(ready, 10000)); EXPECT_EQ(WAIT_OBJECT_0, ::WaitForSingleObject(completed, 10000));
+        ASSERT_TRUE(::SetEvent(command)); worker.WaitAndVerifyExit(); ::CloseHandle(ready); ::CloseHandle(command); ::CloseHandle(completed);
+        std::error_code ignored; std::filesystem::remove_all(backup, ignored);
+    }
+}
+
+TEST(ProfileAcceptance, TransientStartupObservationFailureIsNotAConflict)
+{
+    for (auto phase : { L"transient-unknown", L"transient-unknown-changed" })
+    {
+        SCOPED_TRACE(Json::ToUtf8(phase));
+        TempDirectory temp; temp.path = std::filesystem::path(temp.path.parent_path()) / (L"HidHide-Profiles-Restart-Test-" + NewStableId());
+        ProfileRepository repository(temp.path); repository.OpenOrCreate();
+        auto token = NewStableId(); auto readyName = L"Local\\HidHide.Transient.Ready." + token; auto commandName = L"Local\\HidHide.Transient.Command." + token;
+        auto completedName = L"Local\\HidHide.Transient.Completed." + token; HANDLE ready = ::CreateEventW(nullptr, TRUE, FALSE, readyName.c_str());
+        HANDLE command = ::CreateEventW(nullptr, TRUE, FALSE, commandName.c_str()); HANDLE completed = ::CreateEventW(nullptr, TRUE, FALSE, completedName.c_str()); ASSERT_TRUE(ready && command && completed);
+        auto worker = StartRestartWorker(phase, temp.path, readyName, commandName, completedName);
+        EXPECT_EQ(WAIT_OBJECT_0, ::WaitForSingleObject(ready, 10000)); EXPECT_EQ(WAIT_OBJECT_0, ::WaitForSingleObject(completed, 10000));
+        ASSERT_TRUE(::SetEvent(command)); worker.WaitAndVerifyExit(); ::CloseHandle(ready); ::CloseHandle(command); ::CloseHandle(completed);
+    }
+}
+
 TEST(ProfileAcceptance, SavedButEnforcementFailedRemainsDistinctInService)
 {
     TempDirectory temp; temp.path = std::filesystem::path(temp.path.parent_path()) / (L"HidHide-Profiles-Restart-Test-" + NewStableId());
@@ -709,6 +785,28 @@ TEST(ProfileAcceptance, DeviceNotificationBurstUsesBoundedProductionCoalescer)
     auto completedName = L"Local\\HidHide.DeviceCoalescing.Completed." + token; HANDLE ready = ::CreateEventW(nullptr, TRUE, FALSE, readyName.c_str());
     HANDLE command = ::CreateEventW(nullptr, TRUE, FALSE, commandName.c_str()); HANDLE completed = ::CreateEventW(nullptr, TRUE, FALSE, completedName.c_str()); ASSERT_TRUE(ready && command && completed);
     auto worker = StartRestartWorker(L"device-coalescing", temp.path, readyName, commandName, completedName);
+    ASSERT_EQ(WAIT_OBJECT_0, ::WaitForSingleObject(ready, 10000)); ASSERT_EQ(WAIT_OBJECT_0, ::WaitForSingleObject(completed, 10000));
+    ASSERT_TRUE(::SetEvent(command)); worker.WaitAndVerifyExit(); ::CloseHandle(ready); ::CloseHandle(command); ::CloseHandle(completed);
+}
+
+TEST(ProfileAcceptance, SessionEndRestoresBaselineOnceWithoutTrayExit)
+{
+    TempDirectory temp; temp.path = std::filesystem::path(temp.path.parent_path()) / (L"HidHide-Profiles-Restart-Test-" + NewStableId());
+    auto token = NewStableId(); auto readyName = L"Local\\HidHide.EndSession.Ready." + token; auto commandName = L"Local\\HidHide.EndSession.Command." + token;
+    auto completedName = L"Local\\HidHide.EndSession.Completed." + token; HANDLE ready = ::CreateEventW(nullptr, TRUE, FALSE, readyName.c_str());
+    HANDLE command = ::CreateEventW(nullptr, TRUE, FALSE, commandName.c_str()); HANDLE completed = ::CreateEventW(nullptr, TRUE, FALSE, completedName.c_str()); ASSERT_TRUE(ready && command && completed);
+    auto worker = StartRestartWorker(L"end-session", temp.path, readyName, commandName, completedName);
+    ASSERT_EQ(WAIT_OBJECT_0, ::WaitForSingleObject(ready, 10000)); ASSERT_EQ(WAIT_OBJECT_0, ::WaitForSingleObject(completed, 10000));
+    ASSERT_TRUE(::SetEvent(command)); worker.WaitAndVerifyExit(); ::CloseHandle(ready); ::CloseHandle(command); ::CloseHandle(completed);
+}
+
+TEST(ProfileAcceptance, SessionEndIsNotUndoneByQueuedProfileChange)
+{
+    TempDirectory temp; temp.path = std::filesystem::path(temp.path.parent_path()) / (L"HidHide-Profiles-Restart-Test-" + NewStableId());
+    auto token = NewStableId(); auto readyName = L"Local\\HidHide.EndSessionTick.Ready." + token; auto commandName = L"Local\\HidHide.EndSessionTick.Command." + token;
+    auto completedName = L"Local\\HidHide.EndSessionTick.Completed." + token; HANDLE ready = ::CreateEventW(nullptr, TRUE, FALSE, readyName.c_str());
+    HANDLE command = ::CreateEventW(nullptr, TRUE, FALSE, commandName.c_str()); HANDLE completed = ::CreateEventW(nullptr, TRUE, FALSE, completedName.c_str()); ASSERT_TRUE(ready && command && completed);
+    auto worker = StartRestartWorker(L"end-session-pending-tick", temp.path, readyName, commandName, completedName);
     ASSERT_EQ(WAIT_OBJECT_0, ::WaitForSingleObject(ready, 10000)); ASSERT_EQ(WAIT_OBJECT_0, ::WaitForSingleObject(completed, 10000));
     ASSERT_TRUE(::SetEvent(command)); worker.WaitAndVerifyExit(); ::CloseHandle(ready); ::CloseHandle(command); ::CloseHandle(completed);
 }
@@ -802,6 +900,42 @@ TEST(ProfileRepository, CrossProcessWriterLeaseSerializesApplyAndPreservesCas)
     EXPECT_EQ(std::future_status::timeout, apply.wait_for(std::chrono::milliseconds(250))); ASSERT_TRUE(::SetEvent(command)); ASSERT_EQ(WAIT_OBJECT_0, ::WaitForSingleObject(completed, 10000));
     EXPECT_EQ(1u, apply.get().revision); holder.TerminateAndVerify(); EXPECT_TRUE(repository.Load().snapshot.profiles.count(id));
     ::CloseHandle(ready); ::CloseHandle(command); ::CloseHandle(completed);
+}
+
+TEST(ProfileRepository, ReadingTheRepositoryDoesNotTriggerItsChangeWatcher)
+{
+    // The coordinator reloads when the repository directory changes (same
+    // filter as RepositoryWatcherMain). Taking the writer lease for a read must
+    // not change it, or every reload triggers the next one and the engine's
+    // GUI thread spins forever.
+    TempDirectory temp; ProfileRepository repository(temp.path); repository.OpenOrCreate();
+    HANDLE changed = ::FindFirstChangeNotificationW(temp.path.c_str(), FALSE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE);
+    ASSERT_NE(INVALID_HANDLE_VALUE, changed);
+    RepositoryView view(temp.path);
+    EXPECT_NO_THROW(view.Load());
+    EXPECT_NO_THROW(view.Inspect());
+    EXPECT_NO_THROW(repository.Version(repository.Load().snapshot.settings.selectedGlobalId));
+    EXPECT_EQ(static_cast<DWORD>(WAIT_TIMEOUT), ::WaitForSingleObject(changed, 500));
+    ::FindCloseChangeNotification(changed);
+}
+
+TEST(ProfileRepository, WriterLeaseCannotBeSquattedThroughAGlobalName)
+{
+    // #19: another user could pre-create the predictable Global mutex name,
+    // computed from this user's repository path, and deny access to it.
+    TempDirectory temp; ProfileRepository repository(temp.path); repository.OpenOrCreate();
+    auto canonical = std::filesystem::absolute(temp.path).lexically_normal().native();
+    std::transform(canonical.begin(), canonical.end(), canonical.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+    std::uint64_t fnv{ 1469598103934665603ull }; for (auto c : canonical) { fnv ^= static_cast<std::uint16_t>(c); fnv *= 1099511628211ull; }
+    std::wostringstream name; name << L"Global\\HidHide.Profiles.Repository." << std::hex << fnv;
+    PSECURITY_DESCRIPTOR descriptor{}; ASSERT_TRUE(::ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;GA;;;SY)", SDDL_REVISION_1, &descriptor, nullptr));
+    SECURITY_ATTRIBUTES attributes{ sizeof(attributes), descriptor, FALSE };
+    HANDLE squat = ::CreateMutexW(&attributes, TRUE, name.str().c_str()); ::LocalFree(descriptor); ASSERT_TRUE(squat);
+    LoadResult loaded; EXPECT_NO_THROW(loaded = repository.Load()); EXPECT_TRUE(loaded.issues.empty());
+    auto id = NewStableId(); EXPECT_NO_THROW(repository.Apply(App(id, L"Unblocked", 0, L"C:\\unblocked.exe"), std::nullopt));
+    ::ReleaseMutex(squat); ::CloseHandle(squat);
+    // The lease leaves nothing behind in the repository once released.
+    for (auto const& entry : std::filesystem::directory_iterator(temp.path)) EXPECT_EQ(L".json", entry.path().extension().native()) << Json::ToUtf8(entry.path().filename().native());
 }
 
 TEST(ProfileRepository, ExportBackupCollisionTraversalAndLockedTargetAreSafe)
@@ -921,6 +1055,50 @@ TEST(ProfileRepository, CommittedCleanupFailureReturnsTruthfulSavedOutcome)
     ProfileRepository restarted(temp.path); restarted.Recover(); EXPECT_EQ(L"Durably saved", restarted.Load().snapshot.profiles.at(id).name);
 }
 
+TEST(ProfileRepository, OrdinarySaveFailureRollsBackInProcessAndKeepsRepositoryLoadable)
+{
+    // A real sharing violation (for example antivirus) on the second target,
+    // after the intent is durable and the first target was replaced.
+    TempDirectory temp; ProfileRepository repository(temp.path); auto loaded = repository.OpenOrCreate(); auto id = loaded.snapshot.settings.selectedGlobalId;
+    auto oldBytes = RepositoryBytes(temp.path);
+    auto changed = loaded.snapshot.profiles.at(id); changed.name = L"Changed"; auto settings = loaded.snapshot.settings; settings.mode = Mode::UseGlobal;
+    HANDLE locked = ::CreateFileW((temp.path / L"settings.json").c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    ASSERT_NE(INVALID_HANDLE_VALUE, locked);
+    EXPECT_THROW(repository.Apply(changed, repository.Version(id), settings, repository.SettingsVersion()), std::system_error);
+    EXPECT_FALSE(std::filesystem::exists(temp.path / L".transaction.intent"));
+    RepositoryView view(temp.path); LoadResult reloaded;
+    EXPECT_NO_THROW(reloaded = view.Load()); EXPECT_EQ(oldBytes, RepositoryBytes(temp.path));
+    EXPECT_EQ(Mode::Automatic, reloaded.snapshot.settings.mode); EXPECT_TRUE(view.Inspect().issues.empty());
+    ::CloseHandle(locked);
+    EXPECT_NO_THROW(repository.Apply(changed, repository.Version(id), settings, repository.SettingsVersion()));
+    EXPECT_EQ(L"Changed", view.Load().snapshot.profiles.at(id).name);
+}
+
+TEST(ProfileRepository, CommittedSaveWithPendingCleanupRemainsLoadable)
+{
+    // The coordinator's watcher reloads through RepositoryView while cleanup
+    // of a committed save is still blocked by a locked staging file.
+    TempDirectory temp; ProfileRepository setup(temp.path); auto loaded = setup.OpenOrCreate(); auto id = loaded.snapshot.settings.selectedGlobalId; HANDLE locked{};
+    ProfileRepository failing(temp.path, [&](CommitBoundary boundary, std::size_t)
+    {
+        if (boundary != CommitBoundary::CommitMarked) return;
+        for (auto const& entry : std::filesystem::directory_iterator(temp.path)) if (entry.path().extension() == L".bak")
+        { locked = ::CreateFileW(entry.path().c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr); break; }
+    });
+    auto changed = loaded.snapshot.profiles.at(id); changed.name = L"Committed";
+    failing.Apply(changed, failing.Version(id)); ASSERT_NE(INVALID_HANDLE_VALUE, locked); ASSERT_TRUE(failing.CleanupPending());
+    RepositoryView view(temp.path); LoadResult reloaded;
+    EXPECT_NO_THROW(reloaded = view.Load()); EXPECT_EQ(L"Committed", reloaded.snapshot.profiles.at(id).name);
+    EXPECT_TRUE(view.Inspect().issues.empty());
+    // An uncommitted intent still blocks, and a mismatched marker is not trusted.
+    auto intent = ReadBytes(temp.path / L".transaction.committed");
+    { std::ofstream out(temp.path / L".transaction.committed", std::ios::binary | std::ios::trunc); out << "00000000-0000-0000-0000-000000000000"; }
+    EXPECT_THROW(view.Load(), std::runtime_error); EXPECT_FALSE(view.Inspect().issues.empty());
+    { std::ofstream out(temp.path / L".transaction.committed", std::ios::binary | std::ios::trunc); out.write(intent.data(), static_cast<std::streamsize>(intent.size())); }
+    ::CloseHandle(locked); setup.Recover();
+    EXPECT_FALSE(std::filesystem::exists(temp.path / L".transaction.intent")); EXPECT_EQ(L"Committed", view.Load().snapshot.profiles.at(id).name);
+}
+
 TEST(ProfileRepository, RecoveryIsIdempotentAfterEveryRestoredItemAndFullVerification)
 {
     for (auto injection : std::vector<std::pair<CommitBoundary, std::size_t>>{
@@ -997,6 +1175,17 @@ TEST(ProfileEnforcement, DedupReobservesAndRepairsExternalChange)
     ASSERT_TRUE(adapter.Reconcile(desired).success); EXPECT_EQ(1u, fake.writes);
     ASSERT_TRUE(adapter.Reconcile(desired).success); EXPECT_EQ(1u, fake.writes); EXPECT_EQ(1u, fake.observations);
     fake.observation.observed.hiddenDevices.clear(); ASSERT_TRUE(adapter.Reconcile(desired).success); EXPECT_EQ(2u, fake.writes); EXPECT_EQ(2u, fake.observations);
+}
+
+TEST(ProfileEnforcement, NormalizedAllowedAppMapsToVolumeImageName)
+{
+    // JSON Allowed apps are stored lower-case; Windows mount points are not.
+    wchar_t temporary[MAX_PATH]{}; ASSERT_TRUE(::GetTempPathW(MAX_PATH, temporary));
+    auto original = std::filesystem::path(temporary) / L"Feeder.exe"; auto normalized = NormalizeExecutable(original);
+    auto expected = HidHide::FileNameToFullImageName(original); ASSERT_FALSE(expected.empty());
+    auto image = HidHide::FileNameToFullImageName(normalized); ASSERT_FALSE(image.empty());
+    EXPECT_EQ(0, _wcsicmp(expected.c_str(), image.c_str()));
+    EXPECT_EQ(normalized, NormalizeExecutable(HidHide::FullImageNameToFileName(image)));
 }
 
 TEST(ProfileEnforcement, CoordinatorProxyStartupRefreshDoesNotRequireLegacyCatalog)
@@ -1273,6 +1462,35 @@ TEST(ProcessLifetimeCache, IrrelevantDisabledDeletedAndChangedPathsReleaseHandle
     DWORD after{}; ASSERT_TRUE(::GetProcessHandleCount(::GetCurrentProcess(), &after)); EXPECT_LE(after, before + 2);
 }
 
+TEST(ProcessLifetimeCache, UnnormalizableObservedPathsAreNoMatchAndReleaseHandles)
+{
+    // A same-name image on a network share (or any path a profile could never
+    // name) must not stop monitoring: it simply does not match.
+    ActivationFixture f; ProcessLifetimeCache cache; cache.Retain(f.snapshot);
+    std::vector<std::filesystem::path> observedPaths{ L"\\\\nas\\apps\\A.exe", L"\\\\?\\C:\\A.exe", L"\\\\?\\UNC\\nas\\apps\\A.exe",
+        L"C:\\A.scr", L"relative\\A.exe", std::wstring(L"C:\\A\0.exe", 9) };
+    DWORD before{}; ASSERT_TRUE(::GetProcessHandleCount(::GetCurrentProcess(), &before));
+    unsigned pid{ 100 };
+    for (auto const& path : observedPaths)
+    {
+        ProcessObservation observed{ ++pid, 10, path.filename().native(), path, true };
+        bool relevant{ true }; EXPECT_NO_THROW(relevant = cache.Relevant(observed)); EXPECT_FALSE(relevant);
+        HANDLE retained{};
+        ASSERT_TRUE(::DuplicateHandle(::GetCurrentProcess(), ::GetCurrentProcess(), ::GetCurrentProcess(), &retained, 0, FALSE, DUPLICATE_SAME_ACCESS));
+        EXPECT_NO_THROW(cache.Remember(retained, observed));
+        auto exited = observed; exited.exitedAt = 20; EXPECT_NO_THROW(cache.RememberExit(exited));
+        std::wstring selected; EXPECT_NO_THROW(selected = f.Scan({ observed }));
+        EXPECT_EQ(f.global, selected);
+        EXPECT_NO_THROW(selected = f.Scan({ observed, f.Process(f.a, 1, 30) }));
+        EXPECT_EQ(f.a, selected);
+        EXPECT_NO_THROW(selected = f.Scan({ exited, f.Process(f.a, 1, 30) }));
+        EXPECT_EQ(f.a, selected);
+        EXPECT_NO_THROW(selected = f.Scan({}));
+    }
+    EXPECT_EQ(0u, cache.HandleCount()); EXPECT_EQ(0u, cache.IntervalCount());
+    DWORD after{}; ASSERT_TRUE(::GetProcessHandleCount(::GetCurrentProcess(), &after)); EXPECT_LE(after, before + 2);
+}
+
 TEST(ProcessLifetimeCache, OverlappingExitsCompactAndDisjointEpisodesRemainDistinct)
 {
     ActivationFixture f; ProcessLifetimeCache cache; cache.Retain(f.snapshot);
@@ -1344,4 +1562,83 @@ TEST(ProcessLifetimeCache, RecycledPidDuringIncompleteInactiveGapExpiresPinAfter
     EXPECT_EQ(SelectionReason::Application,f.history.Select(f.snapshot).reason);
     EXPECT_EQ((std::vector<std::wstring>{f.c,f.a,f.b}),f.history.Running());
     cache.ConsumeExited(); EXPECT_EQ(f.a,f.Scan({b,successor}));
+}
+
+TEST(CliAppClean, KeepsFeedersOnVolumesThatAreNotMounted)
+{
+    // --app-clean removes only entries whose executable is provably gone. A
+    // feeder on a volume that is not mounted (for example an unplugged USB
+    // drive) must stay whitelisted so it can still read hidden devices.
+    std::vector<wchar_t> module(32768);
+    auto size = ::GetModuleFileNameW(nullptr, module.data(), static_cast<DWORD>(module.size())); ASSERT_GT(size, 0u);
+    std::filesystem::path present(std::wstring(module.data(), size));
+    TempDirectory temp; auto removed = temp.path / L"Uninstalled.exe";
+    auto presentImage = HidHide::FileNameToFullImageName(present), removedImage = HidHide::FileNameToFullImageName(removed);
+    ASSERT_FALSE(presentImage.empty()); ASSERT_FALSE(removedImage.empty());
+    HidHide::FullImageName unmounted{ L"\\Device\\DefinitelyMissingVolume\\Feeder.exe" };
+    auto missing = HidHide::MissingWhitelistEntries({ presentImage, removedImage, unmounted });
+    std::wstring kept; for (auto const& image : missing) kept += image.native() + L";";
+    EXPECT_TRUE(missing == HidHide::FullImageNames({ removedImage })) << Json::ToUtf8(kept);
+}
+
+TEST(ProfileJson, NumbersAcceptOnlyAsciiDigits)
+{
+    // #30: iswdigit also classifies fullwidth and other Unicode digits.
+    for (std::wstring text : { L"\xFF11", L"1\xFF10", L"\x0661", L"-\xFF11", L"7\x0664" })
+        EXPECT_THROW(Json::Parser(text).Parse(), std::runtime_error) << Json::ToUtf8(text);
+    EXPECT_EQ(42u, std::get<std::uint64_t>(Json::Parser(L"42").Parse().data));
+}
+
+TEST(ProfileJson, AllowedAppsDifferingOnlyInCaseRoundTrip)
+{
+    // #27: entries that normalize to the same path must be written once.
+    Settings settings{ 1, L"00000000-0000-0000-0000-000000000001", Mode::Automatic, false, false, {} };
+    settings.allowedApplications = { L"C:\\Feeders\\Gremlin.exe", L"c:\\feeders\\gremlin.exe" };
+    Settings parsed; EXPECT_NO_THROW(parsed = ParseSettings(SerializeSettings(settings)));
+    EXPECT_EQ(1u, parsed.allowedApplications.size());
+}
+
+TEST(ProfileDomain, ExecutableMatchingFoldsNonAsciiCase)
+{
+    // #28: Windows paths are case-insensitive beyond ASCII.
+    std::wstring upper{ L"C:\\Spiele\\" }; upper += L'\x00C4'; upper += L"RGER.exe";
+    std::wstring lower{ L"c:\\spiele\\" }; lower += L'\x00E4'; lower += L"rger.exe";
+    EXPECT_TRUE(NormalizeExecutable(upper) == NormalizeExecutable(lower));
+    std::wstring cyrillicUpper{ L"C:\\" }; for (wchar_t c : { L'\x0418', L'\x0413', L'\x0420', L'\x042B' }) cyrillicUpper += c; cyrillicUpper += L"\\GAME.EXE";
+    std::wstring cyrillicLower{ L"c:\\" }; for (wchar_t c : { L'\x0438', L'\x0433', L'\x0440', L'\x044B' }) cyrillicLower += c; cyrillicLower += L"\\game.exe";
+    EXPECT_TRUE(NormalizeExecutable(cyrillicUpper) == NormalizeExecutable(cyrillicLower));
+}
+
+TEST(ProfileRepository, OversizedCatalogFileIsRejectedBeforeAnyWrite)
+{
+    // #26: a valid profile can serialize beyond the 4 MiB read limit.
+    TempDirectory temp; ProfileRepository repository(temp.path); repository.OpenOrCreate(); auto before = RepositoryBytes(temp.path);
+    std::vector<DeviceRule> rules;
+    for (std::size_t i{}; i < 200; ++i) rules.push_back({ L"HID\\VID_1234&PID_" + std::to_wstring(i) + L"\\" + std::wstring(30000, L'X'), L"", Visibility::Hidden });
+    auto huge = App(NewStableId(), L"Huge", 1, L"C:\\Games\\Huge.exe", rules); ASSERT_NO_THROW(Validate(huge));
+    EXPECT_THROW(repository.Apply(huge, std::nullopt), std::invalid_argument);
+    EXPECT_EQ(before, RepositoryBytes(temp.path));
+    LoadResult loaded; EXPECT_NO_THROW(loaded = RepositoryView(temp.path).Load()); EXPECT_TRUE(loaded.issues.empty());
+}
+
+TEST(ProfileClientSource, ResourceEditorNextValuesDoNotCollide)
+{
+    // #34: the resource editor assigns _APS_NEXT_* to the next new object.
+    auto root=std::filesystem::path(__FILE__).parent_path().parent_path();
+    std::istringstream in(ReadBytes(root/L"HidHideClient/resource.h")); std::string line;
+    std::map<std::string,unsigned long> maxima, next;
+    while (std::getline(in,line))
+    {
+        std::istringstream fields(line); std::string define, name, value;
+        if (!(fields >> define >> name >> value) || define != "#define" || value.empty() || !std::isdigit(static_cast<unsigned char>(value[0]))) continue;
+        auto number = std::stoul(value, nullptr, 0);
+        if (name.rfind("_APS_NEXT_", 0) == 0) { next[name] = number; continue; }
+        auto prefix = name.substr(0, name.find('_'));
+        auto kind = prefix == "IDC" ? "control" : prefix == "IDS" ? "string" : prefix.rfind("ID",0) == 0 && name.rfind("ID_",0) == 0 ? "command" : "resource";
+        maxima[kind] = (std::max)(maxima[kind], number);
+    }
+    ASSERT_TRUE(next.count("_APS_NEXT_CONTROL_VALUE") && next.count("_APS_NEXT_RESOURCE_VALUE") && next.count("_APS_NEXT_COMMAND_VALUE"));
+    EXPECT_GT(next["_APS_NEXT_CONTROL_VALUE"], maxima["control"]);
+    EXPECT_GT(next["_APS_NEXT_RESOURCE_VALUE"], maxima["resource"]);
+    EXPECT_GT(next["_APS_NEXT_COMMAND_VALUE"], maxima["command"]);
 }

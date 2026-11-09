@@ -5,6 +5,7 @@
 #include "DriverRegistrySnapshot.h"
 #include <future>
 #include <thread>
+#include <aclapi.h>
 #pragma comment(lib, "Advapi32.lib")
 using namespace HidHide;
 TEST(Maintenance, UninstallRemovesOnlyExactOwnedStartupCommands) {
@@ -242,6 +243,26 @@ TEST(Maintenance, IncompleteDurableMarkerBlocksUntilRemoved) {
     EXPECT_EQ(ERROR_SUCCESS, RegDeleteKeyExW(HKEY_CURRENT_USER, path.c_str(), KEY_WOW64_64KEY, 0));
     EXPECT_FALSE(Maintenance::DurableMarkerExists(HKEY_CURRENT_USER, path.c_str()));
 }
+TEST(Maintenance, MsiHandshakeEventsCanOnlyBeSignalledByTheInitiatingUserOrAdministrators) {
+    // #19: every authenticated user could set another user's Ready/Release events.
+    std::wstring transaction{ L"12345678-1234-1234-1234-1234567890ab" };
+    auto event = CreateMsiEvent(L"Ready", transaction);
+    PACL dacl{}; PSECURITY_DESCRIPTOR descriptor{};
+    auto inspect = Channel::Own(::OpenEventW(READ_CONTROL, FALSE, MsiEventName(L"Ready", transaction).c_str()));
+    ASSERT_EQ(ERROR_SUCCESS, ::GetSecurityInfo(inspect.get(), SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, &dacl, nullptr, &descriptor));
+    std::vector<std::wstring> modifiers;
+    for (DWORD i{}; dacl && i < dacl->AceCount; ++i)
+    {
+        ACCESS_ALLOWED_ACE* ace{}; ASSERT_TRUE(::GetAce(dacl, i, reinterpret_cast<void**>(&ace)));
+        if (ace->Header.AceType != ACCESS_ALLOWED_ACE_TYPE || !(ace->Mask & (EVENT_MODIFY_STATE | GENERIC_ALL))) continue;
+        LPWSTR text{}; ASSERT_TRUE(::ConvertSidToStringSidW(&ace->SidStart, &text)); modifiers.emplace_back(text); ::LocalFree(text);
+    }
+    ::LocalFree(descriptor);
+    std::sort(modifiers.begin(), modifiers.end());
+    std::vector<std::wstring> expected{ Channel::CurrentSid(), L"S-1-5-18", L"S-1-5-32-544" }; std::sort(expected.begin(), expected.end());
+    EXPECT_EQ(expected, modifiers);
+}
+
 TEST(Maintenance, DurableMarkerReadErrorsFailClosed) {
     EXPECT_THROW(Maintenance::DurableMarkerExists(reinterpret_cast<HKEY>(static_cast<ULONG_PTR>(1)), L"InvalidHandle"), std::runtime_error);
 }

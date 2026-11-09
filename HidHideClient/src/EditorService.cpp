@@ -216,8 +216,8 @@ namespace HidHide::Editor
             {L"runningOrder", Value{std::move(runningOrder)}}, {L"manualMaskId", Text(m_Coordinator.ManualMaskId())},
             {L"requestedId", Text(m_Coordinator.RequestedSelection().profileId)},
             {L"status", Text(m_Coordinator.Status())}, {L"conflict", Value{m_Coordinator.HasDriverConflict()}}, {L"repositoryIssues", Value{std::move(issues)}},
-            {L"devices", Value{std::move(devices)}}, {L"deviceError", Text(deviceError)}, {L"repositoryPath", Text(m_Application.Root().native())},
-            {L"adoptionAwaitingSave", Value{m_Coordinator.AdoptionAwaitingSave()}},
+            {L"devices", Value{std::move(devices)}}, {L"deviceError", Text(deviceError)}, {L"repositoryPath", Text(m_Application.Root().native())}, {L"engineInstance", Text(m_Instance)},
+            {L"adoptionAwaitingSave", Value{m_Coordinator.AdoptionAwaitingSave()}}, {L"catalogUninitialized", Value{m_Coordinator.CatalogUninitialized()}},
             {L"adoptedSettings", m_Coordinator.AdoptionAwaitingSave() && m_AdoptedSettings ? Decode(SerializeSettings(*m_AdoptedSettings)) : Value{nullptr}}}};
     }
 
@@ -314,7 +314,18 @@ namespace HidHide::Editor
             throw std::runtime_error("Resolve the uncertain application launch before changing profile settings");
         if (command == L"adopt")
         {
-            WriterLease lease(m_Application.Root()); auto expected = expectedSettings(); auto live = m_Application.SettingsVersion();
+            WriterLease lease(m_Application.Root());
+            if (std::holds_alternative<std::nullptr_t>(Required(request, L"expectedSettings").data))
+            {
+                // No catalog exists yet (null expected settings): adoption seeds
+                // it, under this lease, from the adopted Allowed apps.
+                auto allowed = m_Coordinator.AdoptExternalStateForNewCatalog();
+                auto loaded = m_Application.OpenOrCreateObserved(std::move(allowed));
+                if (!loaded.issues.empty()) throw std::runtime_error("Current driver settings were accepted, but the profile catalog could not be created; refresh before retrying");
+                auto version = loaded.settingsVersion; m_AdoptedSettings.reset();
+                return Outcome(m_Coordinator.PublishSaved(std::move(loaded), version, L"Profile catalog"));
+            }
+            auto expected = expectedSettings(); auto live = m_Application.SettingsVersion();
             if (live.revision != expected.revision || live.sha256 != expected.sha256) throw RepositoryConflict("Settings changed during driver conflict confirmation. Refresh before retrying");
             auto allowed = m_Coordinator.AdoptExternalState();
             if (allowed == m_Coordinator.Snapshot().settings.allowedApplications)

@@ -27,7 +27,7 @@ Release uses a new output directory and already-built version-consistent apps:
 
 The staging directory must contain both native executables and the complete
 Editor subdirectory produced by unified Ci. Desktop acceptance runs separately:
-`cd Editor; npm run test:ui; node tests/native-integration.mjs; node tests/launch-order.mjs; node tests/recent-mask.mjs`. These tests use
+`cd Editor; npm run test:ui; node tests/editor-regressions.mjs; node tests/native-integration.mjs; node tests/launch-order.mjs; node tests/recent-mask.mjs`. These tests use
 isolated fixtures and require an interactive desktop; they do not operate the
 installed driver. See docs/electron-editor.md.
 

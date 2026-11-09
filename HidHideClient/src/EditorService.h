@@ -30,5 +30,7 @@ namespace HidHide::Editor
         IProfilesDeviceSource& m_Devices;
         Channel::Handle m_EditorProcess{nullptr, &::CloseHandle};
         std::optional<Profiles::Settings> m_AdoptedSettings;
+        // Lets the editor detect a restarted engine and register again.
+        std::wstring const m_Instance{ Profiles::NewStableId() };
     };
 }

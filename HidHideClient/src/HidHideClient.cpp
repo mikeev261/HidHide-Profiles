@@ -36,12 +36,13 @@ namespace
         HidHide::Profiles::EnforcementResult Reconcile(HidHide::Profiles::DesiredEnforcement const& desired) override
         {
             if (m_FailReconcile) return { false, false, {}, L"Injected deterministic enforcement failure" };
-            m_State = desired; ++m_Writes; return { true, true, m_State, {} };
+            m_State = desired; m_Baseline.allowedApplications = desired.allowedApplications; ++m_Writes; return { true, true, m_State, {} };
         }
-        HidHide::Profiles::EnforcementResult RestoreBaseline() override { m_State = m_Baseline; return { true, true, m_State, {} }; }
+        HidHide::Profiles::EnforcementResult RestoreBaseline() override { ++m_Restores; m_State = m_Baseline; return { true, true, m_State, {} }; }
         HidHide::Profiles::EnforcementResult AdoptCurrentAsBaseline() override { ++m_Adoptions; m_RecoveryEvidence.clear(); m_Baseline = m_State; return { true, true, m_State, {} }; }
         std::uint64_t Writes() const noexcept { return m_Writes; }
         std::uint64_t Adoptions() const noexcept { return m_Adoptions; }
+        std::uint64_t Restores() const noexcept { return m_Restores; }
         std::vector<std::uint8_t> RecoveryEvidence() const { return m_RecoveryEvidence; }
         void FailReconcile(bool value) noexcept { m_FailReconcile = value; }
         void SetObservationMode(ObservationMode value) noexcept { m_ObservationMode = value; }
@@ -50,6 +51,7 @@ namespace
         HidHide::Profiles::DesiredEnforcement m_State, m_Baseline;
         std::uint64_t m_Writes{};
         std::uint64_t m_Adoptions{};
+        std::uint64_t m_Restores{};
         bool m_FailReconcile{};
         ObservationMode m_ObservationMode{ ObservationMode::Normal };
         std::vector<std::uint8_t> m_RecoveryEvidence{ 0x52, 0x45, 0x43, 0x56 };
@@ -84,6 +86,91 @@ namespace
         transport.admissionName = L"Local\\HidHide.ProfilesTest.Admission." + suffix;
         transport.barrierName = L"Local\\HidHide.ProfilesTest.Maintenance." + suffix;
         return transport;
+    }
+
+    // Accepting an external change while a profile hides devices adopts only
+    // what changed outside HidHide Profiles. The profile's own hiding never
+    // becomes the baseline, in process or after a restart, and a crash right
+    // after adoption still recovers the original baseline.
+    void ExerciseAdoptionKeepsOriginalBaseline(HidHide::Profiles::DesiredEnforcement const& desired)
+    {
+        // The feeder is on an unmounted volume, so JSON policy keeps it as is.
+        std::wstring const feederImage{ L"\\Device\\DefinitelyMissingVolume\\AdoptedFeeder.exe" };
+        std::wstring const externalDevice{ L"HID\\EXTERNAL\\ADDED" };
+        for (bool restart : { false, true }) for (bool crashAfterAdoption : { false, true })
+        {
+            HidHide::Configuration adoptState; std::optional<std::vector<std::uint8_t>> stored;
+            auto transport = IsolatedProfileTestTransport(ProfilesDriverTransport{
+                [&] { return adoptState; },
+                [&](auto const& expected, auto const& requested)
+                {
+                    if (HidHide::DriverState(adoptState) != expected) throw std::runtime_error("test transport CAS mismatch");
+                    HidHide::SetDriverState(adoptState, requested);
+                }, true,
+                [&] { return stored; }, [&](auto const& bytes) { stored = bytes; }, [&] { stored.reset(); } });
+            auto requireOriginalBaselineWithExternalChange = [&](char const* message)
+            {
+                if (adoptState.active || adoptState.inverse || adoptState.blacklist.size() != 1 || !adoptState.blacklist.count(externalDevice)
+                    || adoptState.whitelist.size() != 1 || !adoptState.whitelist.count(feederImage) || stored)
+                    throw std::runtime_error(message);
+            };
+            auto running = std::make_unique<CProfilesEnforcementAdapter>(transport);
+            if (!running->Reconcile(desired).success || !stored) throw std::runtime_error("profile hiding was not applied with recovery evidence");
+            auto external = adoptState; external.whitelist.emplace(feederImage); external.blacklist.emplace(externalDevice);
+            running->CommitExternalRequest(adoptState, external);
+            if (running->Observe().success) throw std::runtime_error("an external driver change was not reported as a conflict");
+            if (restart)
+            {
+                running.reset(); running = std::make_unique<CProfilesEnforcementAdapter>(transport);
+                if (running->Observe().success || !stored) throw std::runtime_error("mismatched recovery evidence did not block the restarted runtime");
+            }
+            auto adopted = running->AdoptCurrentAsBaseline();
+            if (!adopted.success || !adoptState.active || !adoptState.blacklist.count(L"HID\\EXACT\\ONE")) throw std::runtime_error("external driver change could not be adopted");
+            if (crashAfterAdoption)
+            {
+                running.reset(); running = std::make_unique<CProfilesEnforcementAdapter>(transport);
+                if (!running->Observe().success) throw std::runtime_error("recovery after adoption did not resolve");
+                requireOriginalBaselineWithExternalChange("crash recovery after adoption kept profile hiding as baseline");
+                // Re-apply the profile over the recovered baseline before exit.
+                auto reapplied = running->Reconcile(desired);
+                if (!reapplied.success || !adoptState.active || !adoptState.blacklist.count(L"HID\\EXACT\\ONE") || !adoptState.whitelist.count(feederImage))
+                    throw std::runtime_error("profile could not be re-applied after adoption");
+            }
+            if (!running->RestoreBaseline().success) throw std::runtime_error("baseline restoration after adoption failed");
+            requireOriginalBaselineWithExternalChange(restart ? "adoption after restart made profile hiding the baseline" : "adoption made profile hiding the baseline");
+        }
+        // A profile switch whose driver commit fails, before any change or part
+        // way, leaves HidHide's own state behind; adoption must not mistake it
+        // for an external change. Here the switch pauses hiding.
+        for (bool partial : { false, true })
+        {
+            HidHide::Configuration adoptState; std::optional<std::vector<std::uint8_t>> stored; bool failNextCommit{};
+            auto transport = IsolatedProfileTestTransport(ProfilesDriverTransport{
+                [&] { return adoptState; },
+                [&](auto const& expected, auto const& requested)
+                {
+                    if (HidHide::DriverState(adoptState) != expected) throw std::runtime_error("test transport CAS mismatch");
+                    if (!std::exchange(failNextCommit, false)) { HidHide::SetDriverState(adoptState, requested); return; }
+                    // Partial: the device list is written, the active flag write fails.
+                    if (partial) { auto written = requested; written.active = expected.active; HidHide::SetDriverState(adoptState, written); }
+                    throw std::runtime_error("injected IOCTL failure");
+                }, true,
+                [&] { return stored; }, [&](auto const& bytes) { stored = bytes; }, [&] { stored.reset(); } });
+            CProfilesEnforcementAdapter running(transport);
+            if (!running.Reconcile(desired).success) throw std::runtime_error("profile hiding was not applied");
+            failNextCommit = true; auto paused = desired; paused.hidingEnabled = false; paused.hiddenDevices.clear();
+            if (running.Reconcile(paused).success) throw std::runtime_error("injected commit failure was not reported");
+            if (!partial)
+            {
+                auto external = adoptState; external.whitelist.emplace(feederImage);
+                running.CommitExternalRequest(adoptState, external);
+            }
+            if (running.Observe().success) throw std::runtime_error("changed driver state was not reported as a conflict");
+            if (!running.AdoptCurrentAsBaseline().success) throw std::runtime_error("driver state after a failed switch could not be adopted");
+            if (!running.RestoreBaseline().success) throw std::runtime_error("baseline restoration after a failed switch failed");
+            if (adoptState.active || !adoptState.blacklist.empty() || adoptState.whitelist.size() != (partial ? 0u : 1u) || stored)
+                throw std::runtime_error(partial ? "adoption after a partial profile switch kept HidHide's own hiding" : "adoption after a failed profile switch kept profile hiding");
+        }
     }
 
     bool ExerciseProductionEnforcementAdapter()
@@ -156,11 +243,100 @@ namespace
             auto adopted = saveFailure.AdoptCurrentAsBaseline(); if (!adopted.success || !stored.empty() || clears != 1 || saveFailureCommits) throw std::runtime_error("save-failure explicit adoption did not clear safely");
         }
         {
-            HidHide::Configuration opaqueState; opaqueState.whitelist.emplace(L"\\Device\\DefinitelyMissingVolume\\opaque.exe");
-            CProfilesEnforcementAdapter opaque(IsolatedProfileTestTransport(ProfilesDriverTransport{ [&] { return opaqueState; }, [](auto const&, auto const&) {}, false }));
-            auto observation = opaque.Observe(); if (observation.success || observation.observedKnown) throw std::runtime_error("opaque Allowed-app observation was called verified");
-            auto reconcile = opaque.Reconcile({}); if (reconcile.success || reconcile.observedKnown) throw std::runtime_error("opaque Allowed-app reconciliation was called verified");
+            // JSON Allowed apps are normalized to lower case before they reach
+            // the adapter; they must still map to a volume image name.
+            wchar_t temporary[MAX_PATH]{}; if (!::GetTempPathW(MAX_PATH, temporary)) return false;
+            auto withFeeder = desired; withFeeder.allowedApplications.emplace(HidHide::Profiles::NormalizeExecutable(std::filesystem::path(temporary) / L"Feeder.exe"));
+            HidHide::Configuration feederState;
+            CProfilesEnforcementAdapter feederAdapter(IsolatedProfileTestTransport(ProfilesDriverTransport{
+                [&] { return feederState; }, [&](auto const&, auto const& requested) { HidHide::SetDriverState(feederState, requested); }, false }));
+            auto feederApplied = feederAdapter.Reconcile(withFeeder);
+            if (!feederApplied.success || !(feederApplied.observed == withFeeder) || feederState.whitelist.size() != 1)
+                throw std::runtime_error("a normalized Allowed app could not be applied to the driver");
         }
+        {
+            // Allowed apps are JSON policy, not temporary enforcement. Exit and
+            // crash recovery restore hiding but keep the applied Allowed apps,
+            // so feeders stay whitelisted and the next start sees no conflict.
+            wchar_t temporary[MAX_PATH]{}; if (!::GetTempPathW(MAX_PATH, temporary)) return false;
+            auto feeder = HidHide::Profiles::NormalizeExecutable(std::filesystem::path(temporary) / L"Feeder.exe");
+            auto withFeeder = desired; withFeeder.allowedApplications.emplace(feeder);
+            auto feederOnly = HidHide::Profiles::DesiredEnforcement{}; feederOnly.allowedApplications.emplace(feeder);
+            for (bool crash : { false, true })
+            {
+                HidHide::Configuration feederState; std::optional<std::vector<std::uint8_t>> stored;
+                auto transport = IsolatedProfileTestTransport(ProfilesDriverTransport{
+                    [&] { return feederState; },
+                    [&](auto const& expected, auto const& requested)
+                    {
+                        if (HidHide::DriverState(feederState) != expected) throw std::runtime_error("test transport CAS mismatch");
+                        HidHide::SetDriverState(feederState, requested);
+                    }, true,
+                    [&] { return stored; }, [&](auto const& bytes) { stored = bytes; }, [&] { stored.reset(); } });
+                {
+                    CProfilesEnforcementAdapter running(transport);
+                    auto feederApplied = running.Reconcile(withFeeder);
+                    if (!feederApplied.success || !(feederApplied.observed == withFeeder) || !stored) throw std::runtime_error("feeder reconciliation failed");
+                    if (!crash)
+                    {
+                        auto exitRestored = running.RestoreBaseline();
+                        if (!exitRestored.success || !(exitRestored.observed == feederOnly) || stored) throw std::runtime_error("exit restoration removed a JSON-allowed feeder");
+                    }
+                }
+                CProfilesEnforcementAdapter restarted(transport);
+                auto restartObserved = restarted.Observe();
+                if (!restartObserved.success || !restartObserved.observedKnown || !(restartObserved.observed == feederOnly) || stored)
+                    throw std::runtime_error(crash ? "crash recovery removed a JSON-allowed feeder" : "restart observed a removed JSON-allowed feeder");
+                // Removing the feeder from JSON must survive restoration as well.
+                auto removed = restarted.Reconcile(desired);
+                if (!removed.success || !(removed.observed == desired)) throw std::runtime_error("feeder removal reconciliation failed");
+                auto removalRestored = restarted.RestoreBaseline();
+                if (!removalRestored.success || !(removalRestored.observed == HidHide::Profiles::DesiredEnforcement{}) || stored)
+                    throw std::runtime_error("exit restoration re-added a feeder removed from JSON");
+            }
+        }
+        {
+            // An Allowed-app entry on a volume that is not mounted (for example a
+            // feeder on a removed USB drive) has no path to show, but it is kept
+            // exactly and must not disable observation, reconciliation or exit.
+            std::wstring const opaqueImage{ L"\\Device\\DefinitelyMissingVolume\\opaque.exe" };
+            HidHide::Configuration opaqueState; opaqueState.whitelist.emplace(opaqueImage);
+            CProfilesEnforcementAdapter opaque(IsolatedProfileTestTransport(ProfilesDriverTransport{ [&] { return opaqueState; },
+                [&](auto const&, auto const& requested) { HidHide::SetDriverState(opaqueState, requested); }, false }));
+            auto observation = opaque.Observe();
+            if (!observation.success || !observation.observedKnown || !observation.observed.allowedApplications.empty()) throw std::runtime_error("opaque Allowed-app entry disabled observation");
+            auto reconcile = opaque.Reconcile(desired);
+            if (!reconcile.success || !(reconcile.observed == desired) || !opaqueState.whitelist.count(opaqueImage)) throw std::runtime_error("opaque Allowed-app entry was not preserved by reconciliation");
+            auto opaqueRestored = opaque.RestoreBaseline();
+            if (!opaqueRestored.success || opaqueState.active || !opaqueState.blacklist.empty() || opaqueState.whitelist.size() != 1 || !opaqueState.whitelist.count(opaqueImage))
+                throw std::runtime_error("opaque Allowed-app entry was not preserved by baseline restoration");
+            opaqueState.whitelist.emplace(L"\\Device\\AnotherMissingVolume\\external.exe");
+            auto changed = opaque.Observe(); if (changed.success || !changed.conflict) throw std::runtime_error("external opaque Allowed-app change was not detected");
+            auto opaqueAdopted = opaque.AdoptCurrentAsBaseline(); if (!opaqueAdopted.success || !opaque.Observe().success) throw std::runtime_error("opaque Allowed-app entries could not be adopted");
+        }
+        {
+            // Feeder installers call --app-reg more than once while the engine
+            // runs. Only the conflict raised by earlier CLI requests may be
+            // stacked on; any other change in between is still refused.
+            HidHide::Configuration cliState;
+            CProfilesEnforcementAdapter cli(IsolatedProfileTestTransport(ProfilesDriverTransport{ [&] { return cliState; },
+                [&](auto const& expected, auto const& requested)
+                {
+                    if (HidHide::DriverState(cliState) != expected) throw std::runtime_error("test transport CAS mismatch");
+                    HidHide::SetDriverState(cliState, requested);
+                }, false }));
+            auto first = cliState; first.whitelist.emplace(L"\\Device\\HarddiskVolume9\\FeederA.exe");
+            cli.CommitExternalRequest(cliState, first);
+            auto second = cliState; second.whitelist.emplace(L"\\Device\\HarddiskVolume9\\FeederB.exe");
+            try { cli.CommitExternalRequest(cliState, second); }
+            catch (std::exception const&) { throw std::runtime_error("a second CLI request after the first was refused"); }
+            if (cliState.whitelist.size() != 2) throw std::runtime_error("CLI requests were not both applied");
+            if (cli.Observe().success) throw std::runtime_error("CLI-requested state was silently accepted as policy");
+            cliState.blacklist.emplace(L"HID\\THIRD\\PARTY"); auto third = cliState; third.whitelist.emplace(L"\\Device\\HarddiskVolume9\\FeederC.exe");
+            bool refused{}; try { cli.CommitExternalRequest(cliState, third); } catch (std::runtime_error const&) { refused = true; }
+            if (!refused || cliState.whitelist.size() != 2) throw std::runtime_error("a CLI request over an unrelated external change was accepted");
+        }
+        ExerciseAdoptionKeepsOriginalBaseline(desired);
         {
             HidHide::Configuration legacyState; bool legacyPending{ true }; unsigned writes{}, clears{};
             std::map<std::wstring, std::vector<std::uint8_t>> evidence{
@@ -183,14 +359,19 @@ namespace
             HidHide::Configuration opaqueBlockedState; opaqueBlockedState.whitelist.emplace(L"\\Device\\DefinitelyMissingVolume\\opaque.exe");
             bool legacyPending{ true }; unsigned clears{}, writes{}; auto evidence = std::vector<std::uint8_t>{ 4, 5, 6 };
             CProfilesEnforcementAdapter opaqueBlocked(IsolatedProfileTestTransport(ProfilesDriverTransport{
-                [&] { return opaqueBlockedState; }, [&](auto const&, auto const&) { ++writes; }, true,
+                [&] { return opaqueBlockedState; }, [&](auto const&, auto const& requested) { ++writes; HidHide::SetDriverState(opaqueBlockedState, requested); }, true,
                 []() -> std::optional<std::vector<std::uint8_t>> { return std::nullopt; }, [](auto const&) {}, [] {},
                 [&] { return legacyPending; }, [&] { ++clears; evidence.clear(); legacyPending = false; } }));
+            if (opaqueBlocked.Observe().success || opaqueBlocked.Reconcile(desired).success || clears || writes)
+                throw std::runtime_error("legacy recovery evidence did not block a runtime with an opaque Allowed-app entry");
+            // The full driver tuple, including the opaque entry, is represented
+            // by the adopted baseline, so explicit adoption may clear evidence.
             auto adopted = opaqueBlocked.AdoptCurrentAsBaseline();
-            if (adopted.success || !adopted.conflict || clears || writes || evidence != std::vector<std::uint8_t>({ 4, 5, 6 }))
-                throw std::runtime_error("opaque blocked adoption destroyed recovery evidence");
-            if (opaqueBlocked.Observe().success || opaqueBlocked.Reconcile(desired).success || opaqueBlocked.RestoreBaseline().success || clears || writes)
-                throw std::runtime_error("failed opaque adoption unblocked enforcement");
+            if (!adopted.success || adopted.conflict || clears != 1 || writes || !evidence.empty())
+                throw std::runtime_error("explicit adoption with an opaque Allowed-app entry did not clear evidence exactly once");
+            if (!opaqueBlocked.Observe().success || !opaqueBlocked.Reconcile(desired).success
+                || !opaqueBlockedState.whitelist.count(L"\\Device\\DefinitelyMissingVolume\\opaque.exe"))
+                throw std::runtime_error("adopted opaque Allowed-app entry was not preserved");
         }
         return true;
     }
@@ -722,10 +903,80 @@ namespace
                 require(dialog.AcceptanceDeviceBurstCoalesced(), "device burst was not bounded and coalesced");
                 dialog.DestroyWindow(); finish();
             }
+            else if (phase == L"end-session")
+            {
+                // Logoff/shutdown terminates the process after WM_ENDSESSION returns,
+                // so the baseline must be restored inside that message, once.
+                ProfilesAcceptanceContext context{root, enforcement, devices, [] { return std::vector<ProcessObservation>{}; }};
+                CHidHideClientDlg dialog(nullptr, context);
+                require(dialog.Create(IDD_DIALOG_APPLICATION) != FALSE, "hidden engine window creation failed");
+                auto before = enforcement.Restores();
+                auto allowed = dialog.SendMessageW(WM_QUERYENDSESSION, 0, ENDSESSION_LOGOFF) == TRUE;
+                auto afterQuery = enforcement.Restores();
+                dialog.SendMessageW(WM_ENDSESSION, FALSE, ENDSESSION_LOGOFF);
+                auto afterCancel = enforcement.Restores(); auto aliveAfterCancel = ::IsWindow(dialog.m_hWnd) != FALSE;
+                dialog.SendMessageW(WM_ENDSESSION, TRUE, ENDSESSION_LOGOFF);
+                auto afterEnd = enforcement.Restores();
+                if (::IsWindow(dialog.m_hWnd)) dialog.DestroyWindow(); // Never unwind with a live HWND.
+                require(allowed, "session end was vetoed");
+                require(afterQuery == before, "session end query restored before the end was confirmed");
+                require(afterCancel == before && aliveAfterCancel, "cancelled session end was destructive");
+                require(afterEnd == before + 1, "session end did not restore the baseline");
+                require(enforcement.Restores() == before + 1, "baseline was restored more than once");
+                finish();
+            }
+            else if (phase == L"end-session-pending-tick")
+            {
+                // A profile change queued before WM_ENDSESSION (apps start and stop
+                // during logoff) must not re-apply hiding after the restore. Restart
+                // Manager closes keep the process alive, so pump what is left.
+                {
+                    ProfileApplicationService application(root); application.OpenOrCreate();
+                    Profile race; race.id = NewStableId(); race.name = L"Race"; race.kind = Kind::Application;
+                    race.executable = NormalizeExecutable(root/L"Race.exe");
+                    race.rules.push_back({L"HID\\RACE_PEDALS", L"Race pedals", Visibility::Hidden});
+                    application.Apply(race, std::nullopt);
+                }
+                std::atomic_bool running{};
+                auto executable = NormalizeExecutable(root/L"Race.exe");
+                ProfilesAcceptanceContext context{root, enforcement, devices, [&]
+                { return running.load() ? std::vector<ProcessObservation>{{4343, 1, L"Race.exe", executable, true}} : std::vector<ProcessObservation>{}; }};
+                CHidHideClientDlg dialog(nullptr, context);
+                require(dialog.Create(IDD_DIALOG_APPLICATION) != FALSE, "hidden engine window creation failed");
+                auto pump = [](DWORD milliseconds)
+                {
+                    MSG message{}; auto deadline = ::GetTickCount64() + milliseconds;
+                    while (::GetTickCount64() < deadline) { while (::PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) { ::TranslateMessage(&message); ::DispatchMessageW(&message); } ::Sleep(10); }
+                };
+                pump(1000);
+                auto hidden = [&] { return enforcement.Observe().observed.hiddenDevices.size(); };
+                auto hiddenBefore = hidden();
+                // The worker publishes the running application while the UI thread is
+                // busy; its WM_PROFILE_CHANGED is still queued when the session ends.
+                running = true; ::Sleep(1500);
+                MSG queued{}; auto pending = ::PeekMessageW(&queued, dialog.m_hWnd, WM_APP, 0xBFFF, PM_NOREMOVE) != FALSE;
+                auto before = enforcement.Restores();
+                dialog.SendMessageW(WM_ENDSESSION, TRUE, ENDSESSION_CLOSEAPP);
+                auto writesAfterEnd = enforcement.Writes(); auto hiddenAfterEnd = hidden();
+                pump(1000);
+                auto writesAfterPump = enforcement.Writes(); auto hiddenAfterPump = hidden();
+                if (::IsWindow(dialog.m_hWnd)) dialog.DestroyWindow(); // Never unwind with a live HWND.
+                require(hiddenBefore == 0 && pending, "fixture did not queue a profile change before the session ended");
+                require(enforcement.Restores() == before + 1 && hiddenAfterEnd == 0, "session end did not restore the baseline");
+                require(writesAfterPump == writesAfterEnd && hiddenAfterPump == 0, "queued profile change re-applied hiding after the session-end restore");
+                require(hidden() == 0, "devices remained hidden after the engine closed");
+                finish();
+            }
             else
             {
                 if (phase == L"unknown-fresh") enforcement.SetObservationMode(AcceptanceEnforcement::ObservationMode::Unknown);
-                if (phase == L"conflict-fresh") enforcement.SetObservationMode(AcceptanceEnforcement::ObservationMode::KnownConflict);
+                if (phase == L"conflict-fresh" || phase == L"conflict-fresh-adopt" || phase == L"conflict-incomplete")
+                    enforcement.SetObservationMode(AcceptanceEnforcement::ObservationMode::KnownConflict);
+                if (phase == L"conflict-fresh-adopt") enforcement.SetAllowedApplications({NormalizeExecutable(root/L"Feeder.exe")});
+                bool repairedAllowed = phase == L"repaired-allowed-reload" || phase == L"repaired-allowed-restore";
+                if (repairedAllowed) enforcement.SetAllowedApplications({NormalizeExecutable(root/L"Feeder.exe")}); // e.g. registered with --app-reg
+                bool transientUnknown = phase == L"transient-unknown" || phase == L"transient-unknown-changed";
+                if (transientUnknown) enforcement.SetObservationMode(AcceptanceEnforcement::ObservationMode::Unknown);
                 ProfileApplicationService application(root); auto initial = enforcement.Observe();
                 application.OpenOrCreateObserved(initial.success && initial.observedKnown && !initial.conflict
                     ? std::optional<std::set<std::filesystem::path>>(initial.observed.allowedApplications) : std::nullopt);
@@ -776,16 +1027,47 @@ namespace
                     require(found != profiles.end() && found->second.name == L"F1 25" && found->second.rules.size() == 2, "saved application did not reload");
                     request("{\"command\":\"snapshot\"}");
                 }
-                else if (phase == L"invalid" || phase == L"unknown-fresh" || phase == L"conflict-fresh")
+                else if (phase == L"invalid" || phase == L"unknown-fresh" || phase == L"conflict-fresh" || phase == L"conflict-incomplete")
                 {
                     auto result = request("{\"command\":\"snapshot\"}"); auto const& snapshot = AsObject(Required(AsObject(result), L"snapshot"));
                     require(!AsArray(Required(snapshot,L"repositoryIssues")).empty() && coordinator.HasRepositoryDiagnostics(), "invalid repository was not blocked");
+                    auto instance = AsString(Required(snapshot,L"engineInstance")); auto again = request("{\"command\":\"snapshot\"}");
+                    require(IsStableId(instance) && AsString(Required(AsObject(Required(AsObject(again), L"snapshot")),L"engineInstance")) == instance, "engine instance identity is missing or unstable");
                     std::string retryRequest="{\"command\":\"retry\"}";
                     auto retryBytes=service.Handle({retryRequest.begin(),retryRequest.end()});
                     auto retry=Parser(FromUtf8(std::string(retryBytes.begin(),retryBytes.end()))).Parse();
                     require(!AsBool(Required(AsObject(retry),L"ok")) || !AsBool(Required(AsObject(retry),L"applied")), "blocked repository retry reported success");
                     request("{\"command\":\"adopt\",\"expectedSettings\":{\"revision\":1,\"hash\":\"invalid\"}}", false);
+                    // Seeding a new catalog is only for a root without any
+                    // catalog evidence and with a driver that can be read.
+                    if (phase != L"conflict-fresh") adopt("null", false);
                     require(enforcement.Writes() == 0 && enforcement.Adoptions() == 0, "blocked service touched driver state");
+                }
+                else if (phase == L"conflict-fresh-adopt")
+                {
+                    // Stale recovery evidence with no catalog: explicit adoption
+                    // is the way out, and the catalog is seeded from it.
+                    auto feeder = NormalizeExecutable(root/L"Feeder.exe");
+                    require(coordinator.HasRepositoryDiagnostics() && coordinator.HasDriverConflict() && !std::filesystem::exists(root/L"settings.json"),
+                        "fresh conflict fixture was not blocked by both repository and driver");
+                    auto before = request("{\"command\":\"snapshot\"}"); auto const& blocked = AsObject(Required(AsObject(before), L"snapshot"));
+                    require(std::holds_alternative<std::nullptr_t>(Required(blocked,L"settingsVersion").data) && AsBool(Required(blocked,L"conflict"))
+                        && AsBool(Required(blocked,L"catalogUninitialized")), "uninitialized catalog was not offered for explicit adoption");
+                    auto adopted = adopt("null");
+                    require(enforcement.Adoptions() == 1 && enforcement.RecoveryEvidence().empty(), "explicit adoption did not clear recovery evidence exactly once");
+                    require(!coordinator.HasDriverConflict() && !coordinator.HasRepositoryDiagnostics() && coordinator.Issues().empty(), "adoption left the engine blocked");
+                    auto loaded = RepositoryView(root).Load();
+                    require(loaded.issues.empty() && loaded.snapshot.settings.allowedApplications == std::set<std::filesystem::path>{feeder}
+                        && coordinator.Snapshot().generation == loaded.snapshot.generation, "catalog was not created from the adopted observation");
+                    require(AsBool(Required(AsObject(adopted),L"saved")) && AsBool(Required(AsObject(adopted),L"applied")) && coordinator.EffectiveSelectionVerified(),
+                        "created catalog was not applied and verified");
+                    enforcement.SetObservationMode(AcceptanceEnforcement::ObservationMode::Normal); // The adopted evidence no longer conflicts.
+                    auto after = request("{\"command\":\"snapshot\"}"); auto const& resolved = AsObject(Required(AsObject(after), L"snapshot"));
+                    require(!std::holds_alternative<std::nullptr_t>(Required(resolved,L"settingsVersion").data) && !AsBool(Required(resolved,L"conflict"))
+                        && AsArray(Required(resolved,L"repositoryIssues")).empty() && !AsBool(Required(resolved,L"catalogUninitialized")), "editor snapshot stayed blocked");
+                    auto settingsBytes = ReadBytes(root/L"settings.json"); adopt("null", false);
+                    require(enforcement.Adoptions() == 1 && settingsBytes == ReadBytes(root/L"settings.json")
+                        && RepositoryView(root).Load().snapshot.generation == loaded.snapshot.generation, "an existing catalog was seeded again");
                 }
                 else if (phase == L"adapter")
                 {
@@ -797,6 +1079,32 @@ namespace
                     require(coordinator.HasRepositoryDiagnostics(), "restore fixture was not initially blocked");
                     request("{\"command\":\"restore\",\"path\":"+ToUtf8(Escape(root.native()+L"-backup"))+"}");
                     require(!coordinator.HasRepositoryDiagnostics() && coordinator.EffectiveSelectionVerified() && enforcement.Writes() == 1, "restore did not recover and apply immediately");
+                }
+                else if (transientUnknown)
+                {
+                    // A transient startup read failure is not a conflict: once the
+                    // driver can be observed, activation proceeds after the
+                    // deferred Allowed-app comparison, which still catches drift.
+                    require(!coordinator.HasDriverConflict() && enforcement.Writes() == 0, "transient startup observation failure became a conflict or applied blindly");
+                    enforcement.SetObservationMode(AcceptanceEnforcement::ObservationMode::Normal);
+                    if (phase == L"transient-unknown-changed") enforcement.SetAllowedApplications({NormalizeExecutable(root/L"Feeder.exe")});
+                    coordinator.AcceptanceScanNow();
+                    if (phase == L"transient-unknown") require(!coordinator.HasDriverConflict() && enforcement.Writes() == 1, "activation did not resume after the driver became observable");
+                    else require(coordinator.HasDriverConflict() && enforcement.Writes() == 0, "external Allowed-app change was overwritten after a transient observation failure");
+                }
+                else if (repairedAllowed)
+                {
+                    // The startup Allowed-app comparison is skipped while the
+                    // repository is invalid; repair must not overwrite the feeder.
+                    require(coordinator.HasRepositoryDiagnostics() && !coordinator.HasDriverConflict(), "repair fixture was not blocked by the repository alone");
+                    if (phase == L"repaired-allowed-restore") request("{\"command\":\"restore\",\"path\":"+ToUtf8(Escape(root.native()+L"-backup"))+"}");
+                    else
+                    {
+                        std::filesystem::copy_file(root.native()+L"-backup\\settings.json", root/L"settings.json", std::filesystem::copy_options::overwrite_existing);
+                        coordinator.ReloadRepositoryIfChanged(); coordinator.AcceptanceScanNow();
+                    }
+                    require(!coordinator.HasRepositoryDiagnostics(), "repaired repository was not reloaded");
+                    require(coordinator.HasDriverConflict() && enforcement.Writes() == 0, "external Allowed-app change was overwritten after repository repair");
                 }
                 else if (phase == L"events")
                 {

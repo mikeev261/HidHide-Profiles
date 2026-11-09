@@ -11,6 +11,15 @@ if (args.Length > 0 && args[0] == "--maintenance-user-child")
     return;
 }
 
+if (args.Length > 0 && args[0] == "--maintenance-user-failing-child")
+{
+    // Mirrors HidHideCLI: the coordinator's refusal is written to stderr only.
+    if (args.Length > 1 && args[1] == "flood") Console.Error.Write(new string('x', 1024 * 1024));
+    Console.Error.WriteLine("Close the HidHide Profiles editor before running setup. Apply or discard its unsaved changes first");
+    Environment.Exit(1627);
+    return;
+}
+
 if (args.Length > 0 && args[0] == "--maintenance-token-only")
 {
     MaintenanceTokenChecks.Run(args.Length > 1 ? int.Parse(args[1]) : 0);

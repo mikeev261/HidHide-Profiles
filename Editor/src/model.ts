@@ -1,4 +1,4 @@
-import type {Profile, CatalogProfile, Snapshot, Draft, Device, Settings, Rule} from './types.ts';
+import type {Profile, CatalogProfile, Snapshot, Draft, Device, Settings, Rule, Version} from './types.ts';
 import {classifyDevice} from './device-kind.ts';
 export const clone = <T,>(value:T):T => structuredClone(value);
 export function duplicateName(name:string,maxLen=256):string{const suffix=' copy';if(name.length+suffix.length<=maxLen)return name+suffix;const target=maxLen-suffix.length;const chars=Array.from(name);let len=0,cut=0;for(const ch of chars){if(len+ch.length>target)break;len+=ch.length;cut++;}return chars.slice(0,cut).join('')+suffix;}
@@ -9,6 +9,9 @@ export function makeDraft(p:CatalogProfile|Profile,s:Snapshot,isNew=false):Draft
  const profile=profileData(p);
  return {profile,settings:clone(s.settings),original:isNew?null:clone(profile),originalSettings:clone(s.settings),expected:isNew?null:('version' in p?p.version:null),expectedSettings:s.settingsVersion,deleting:false};
 }
+// Adoption compares the saved settings it replaces. Only a missing catalog (no
+// profile files at all) is adopted without them; the engine then creates it.
+export function adoptionExpectedSettings(s:Snapshot):Version|null|undefined{return s.settingsVersion??(s.catalogUninitialized?null:undefined);}
 export const same=(a:unknown,b:unknown)=>JSON.stringify(a)===JSON.stringify(b);
 export const dirty=(d:Draft|null)=>!!d&&(d.deleting||!same(d.profile,d.original)||!same(d.settings,d.originalSettings));
 const sameRule=(a:Rule|undefined,b:Rule|undefined)=>a?.identity===b?.identity&&a?.friendlyName===b?.friendlyName&&a?.visibility===b?.visibility;

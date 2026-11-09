@@ -69,26 +69,50 @@ namespace HidHide::Profiles
         std::wostringstream out; out << std::hex << std::setfill(L'0'); for (auto byte : digest) out << std::setw(2) << static_cast<unsigned>(byte); return out.str();
     }
 
+    // Serializes one repository across threads, processes and sessions of the
+    // same user. The lock is an exclusive "<repository>.writer.lock" file next to
+    // the repository directory, in the user's own profile: unlike a predictable
+    // Global object name, other users cannot create or deny it. It is deleted on
+    // release and freed if a holder dies. It is deliberately outside the
+    // repository directory, whose change notifications trigger reloads.
+    // Nested leases on one thread are reentrant, like the mutex this replaces.
     class WriterLease
     {
+        static std::map<std::wstring, std::pair<HANDLE, unsigned>>& Held()
+        { thread_local std::map<std::wstring, std::pair<HANDLE, unsigned>> held; return held; }
+        std::wstring m_Key;
     public:
         explicit WriterLease(std::filesystem::path const& root)
         {
-            auto canonical = std::filesystem::absolute(root).lexically_normal().native();
-            std::transform(canonical.begin(), canonical.end(), canonical.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
-            std::uint64_t fnv{ 1469598103934665603ull }; for (auto c : canonical) { fnv ^= static_cast<std::uint16_t>(c); fnv *= 1099511628211ull; }
-            // Global namespace serializes the same user's repository across
-            // terminal sessions. The root hash keeps unrelated test roots apart.
-            std::wostringstream name; name << L"Global\\HidHide.Profiles.Repository." << std::hex << fnv;
-            m_Mutex = ::CreateMutexW(nullptr, FALSE, name.str().c_str()); if (!m_Mutex) throw std::system_error(::GetLastError(), std::system_category(), "Create repository mutex");
-            auto wait = ::WaitForSingleObject(m_Mutex, 10000); if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED)
-            { auto error = wait == WAIT_TIMEOUT ? ERROR_BUSY : ::GetLastError(); ::CloseHandle(m_Mutex); m_Mutex = nullptr; throw std::system_error(error, std::system_category(), "Acquire repository writer lease"); }
-            m_Acquired = true;
+            auto canonical = std::filesystem::absolute(root).lexically_normal();
+            if (!canonical.has_filename()) canonical = canonical.parent_path();
+            m_Key = canonical.native(); std::transform(m_Key.begin(), m_Key.end(), m_Key.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+            auto& held = Held();
+            if (auto it = held.find(m_Key); it != held.end()) { ++it->second.second; return; }
+            std::error_code ec; std::filesystem::create_directories(canonical, ec);
+            if (ec) throw std::system_error(ec, "Create profile repository");
+            auto path = canonical.parent_path() / (canonical.filename().native() + L".writer.lock"); auto deadline = ::GetTickCount64() + 10000;
+            HANDLE file{};
+            while ((file = ::CreateFileW(path.c_str(), GENERIC_READ | DELETE, 0, nullptr, OPEN_ALWAYS,
+                FILE_ATTRIBUTE_HIDDEN | FILE_FLAG_DELETE_ON_CLOSE, nullptr)) == INVALID_HANDLE_VALUE)
+            {
+                // Held by another writer, or still being deleted by the last one.
+                auto error = ::GetLastError();
+                if ((error != ERROR_SHARING_VIOLATION && error != ERROR_ACCESS_DENIED) || ::GetTickCount64() >= deadline)
+                    throw std::system_error(error == ERROR_SHARING_VIOLATION ? ERROR_BUSY : error, std::system_category(), "Acquire repository writer lease");
+                ::Sleep(15);
+            }
+            try { held.emplace(m_Key, std::make_pair(file, 1u)); } catch (...) { ::CloseHandle(file); throw; }
         }
-        ~WriterLease() { if (m_Acquired) ::ReleaseMutex(m_Mutex); if (m_Mutex) ::CloseHandle(m_Mutex); }
+        ~WriterLease()
+        {
+            auto& held = Held(); auto it = held.find(m_Key);
+            if (it != held.end() && --it->second.second == 0) { ::CloseHandle(it->second.first); held.erase(it); }
+        }
         WriterLease(WriterLease const&) = delete; WriterLease& operator=(WriterLease const&) = delete;
-    private: HANDLE m_Mutex{}; bool m_Acquired{};
     };
+
+    constexpr std::size_t MaxTransactionItems{ MaxProfiles * 2 + 1 };
 
     class RepositoryView
     {
@@ -98,7 +122,7 @@ namespace HidHide::Profiles
         LoadResult Load() const
         {
             WriterLease lease(m_Root);
-            if (std::filesystem::exists(m_Root / L".transaction.intent")) throw std::runtime_error("Profile repository recovery is required");
+            if (TransactionPendingLocked()) throw std::runtime_error("Profile repository recovery is required");
             return LoadLocked(false);
         }
         LoadResult Inspect() const
@@ -106,7 +130,7 @@ namespace HidHide::Profiles
             WriterLease lease(m_Root);
             if (!std::filesystem::exists(m_Root / L"settings.json")) return UninitializedInspection(L"Profile catalog is not initialized; activation is blocked and existing evidence was preserved");
             auto result = LoadLocked(false);
-            if (std::filesystem::exists(m_Root / L".transaction.intent"))
+            if (TransactionPendingLocked())
                 AddIssue(result, m_Root / L".transaction.intent", L"A repository transaction requires recovery; activation is blocked and all evidence was preserved");
             return result;
         }
@@ -119,7 +143,73 @@ namespace HidHide::Profiles
         {
             WriterLease lease(m_Root); return SettingsVersionLocked();
         }
+        // True only for a root that holds no catalog file at all, as opposed to
+        // an incomplete or corrupt catalog whose files are recovery evidence.
+        bool CatalogUninitialized() const
+        {
+            WriterLease lease(m_Root); return !std::filesystem::exists(m_Root / L"settings.json") && !HasCatalogEvidenceLocked();
+        }
     protected:
+        bool HasCatalogEvidenceLocked() const
+        {
+            std::error_code ec;
+            for (auto const& entry : std::filesystem::directory_iterator(m_Root, ec)) if (entry.is_regular_file()) return true;
+            if (ec) throw std::system_error(ec, "Inspect profile repository before initialization");
+            return false;
+        }
+        struct IntentItem { std::wstring fileName, tempName, backupName, sha256, oldSha256; bool existed{}, remove{}; };
+        struct ParsedIntent { std::wstring transaction; std::vector<IntentItem> items; };
+        static bool IsDigest(std::wstring const& value, bool emptyAllowed = false)
+        {
+            if (emptyAllowed && value.empty()) return true;
+            if (value.size() != 64) return false;
+            return std::all_of(value.begin(), value.end(), [](wchar_t c) { return (c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f'); });
+        }
+        static bool IsTargetName(std::wstring const& name)
+        {
+            if (name == L"settings.json") return true;
+            return name.size() == 41 && name.substr(36) == L".json" && IsStableId(name.substr(0, 36));
+        }
+        static ParsedIntent ParseIntent(std::string const& bytes)
+        {
+            auto text = Json::FromUtf8(bytes); std::wistringstream in(text); std::wstring line;
+            if (!std::getline(in, line) || line.rfind(L"HIDHIDE-PROFILES-TRANSACTION-1\t", 0) != 0) throw std::runtime_error("Invalid repository transaction record");
+            ParsedIntent result; result.transaction = line.substr(31); if (!IsStableId(result.transaction)) throw std::runtime_error("Invalid repository transaction id");
+            std::set<std::wstring> targets;
+            while (std::getline(in, line))
+            {
+                if (line.empty()) continue; std::vector<std::wstring> fields; std::size_t start{};
+                for (std::size_t i{}; i <= line.size(); ++i) if (i == line.size() || line[i] == L'\t') { fields.emplace_back(line.substr(start, i - start)); start = i + 1; }
+                auto index = result.items.size(); auto expectedTemp = L"." + result.transaction + L"." + std::to_wstring(index) + L".tmp"; auto expectedBackup = L"." + result.transaction + L"." + std::to_wstring(index) + L".bak";
+                if (fields.size() != 7 || (fields[0] != L"0" && fields[0] != L"1") || (fields[1] != L"0" && fields[1] != L"1")
+                    || !IsTargetName(fields[2]) || fields[3] != expectedTemp || fields[4] != expectedBackup || !IsDigest(fields[5], fields[1] == L"1")
+                    || !IsDigest(fields[6], fields[0] == L"0")) throw std::runtime_error("Invalid repository transaction item");
+                result.items.push_back({ fields[2], fields[3], fields[4], fields[5], fields[6], fields[0] == L"1", fields[1] == L"1" });
+                if (!targets.emplace(fields[2]).second) throw std::runtime_error("Duplicate repository transaction target");
+                if (result.items.size() > MaxTransactionItems) throw std::runtime_error("Repository transaction is too large");
+            }
+            if (result.items.empty()) throw std::runtime_error("Empty repository transaction"); return result;
+        }
+        // An intent blocks loading unless its matching commit marker is durable
+        // and every target verifies: then only staging cleanup remains (for
+        // example a locked backup), which the next writer finishes.
+        bool TransactionPendingLocked() const
+        {
+            auto intentPath = m_Root / L".transaction.intent"; auto committedPath = m_Root / L".transaction.committed";
+            if (!std::filesystem::exists(intentPath)) return false;
+            try
+            {
+                auto parsed = ParseIntent(ReadBytes(intentPath));
+                if (!std::filesystem::exists(committedPath) || Json::FromUtf8(ReadBytes(committedPath)) != parsed.transaction) return true;
+                for (auto const& item : parsed.items)
+                {
+                    auto target = m_Root / item.fileName;
+                    if (item.remove ? std::filesystem::exists(target) : (!std::filesystem::exists(target) || Sha256(ReadBytes(target)) != item.sha256)) return true;
+                }
+                return false;
+            }
+            catch (...) { return true; }
+        }
         LoadResult UninitializedInspection(std::wstring message) const
         {
             LoadResult result; Profile profile; profile.id = L"00000000-0000-0000-0000-000000000001"; profile.name = L"Unsaved recovery view";
@@ -207,8 +297,10 @@ namespace HidHide::Profiles
         std::filesystem::path m_Root;
     };
 
-    enum class CommitBoundary { TempFlushed, IntentFlushed, TargetReplaced, SetVerified, CommitMarked, RecoveryTargetRestored, RecoveryVerified, Completed };
-    constexpr std::size_t MaxTransactionItems{ MaxProfiles * 2 + 1 };
+    // *PartiallyWritten fire halfway through writing a transaction record, so a
+    // failure there leaves exactly what a crash during that write would.
+    enum class CommitBoundary { TempFlushed, IntentFlushed, TargetReplaced, SetVerified, CommitMarked, RecoveryTargetRestored, RecoveryVerified, Completed,
+        IntentPartiallyWritten, CommitMarkPartiallyWritten };
 
     class ProfileRepository : public RepositoryView
     {
@@ -233,10 +325,7 @@ namespace HidHide::Profiles
             }
             if (!std::filesystem::exists(m_Root / L"settings.json"))
             {
-                std::error_code ec; bool hasExistingEvidence{};
-                for (auto const& entry : std::filesystem::directory_iterator(m_Root, ec)) if (entry.is_regular_file()) { hasExistingEvidence = true; break; }
-                if (ec) throw std::system_error(ec, "Inspect profile repository before initialization");
-                if (hasExistingEvidence) return UninitializedInspection(L"Profile repository is incomplete: settings.json is missing; existing files were preserved");
+                if (HasCatalogEvidenceLocked()) return UninitializedInspection(L"Profile repository is incomplete: settings.json is missing; existing files were preserved");
                 if (!initialAllowedApplications) return UninitializedInspection(L"Fresh profile repository initialization requires a successful, conflict-free observed Allowed-app list; no catalog was written");
                 Profile profile; profile.id = NewStableId(); profile.revision = 1; profile.name = L"Default"; profile.kind = Kind::Global;
                 Settings settings; settings.revision = 1; settings.selectedGlobalId = profile.id; settings.allowedApplications = std::move(*initialAllowedApplications);
@@ -404,14 +493,16 @@ namespace HidHide::Profiles
 
     private:
         struct Change { std::wstring fileName; std::string bytes; bool remove{}; };
-        struct IntentItem { std::wstring fileName, tempName, backupName, sha256, oldSha256; bool existed{}, remove{}; };
-        struct ParsedIntent { std::wstring transaction; std::vector<IntentItem> items; };
         LoadResult LoadCommittedAfterMutationLocked() const
         {
             if (!m_CleanupPending) throw std::logic_error("No committed cleanup is pending");
             return LoadLocked(false);
         }
-        void Fire(CommitBoundary boundary, std::size_t index) { if (m_FailureHook) m_FailureHook(boundary, index); }
+        void Fire(CommitBoundary boundary, std::size_t index)
+        {
+            if (!m_FailureHook) return;
+            try { m_FailureHook(boundary, index); } catch (...) { m_InjectedCrash = true; throw; }
+        }
         void EnsureExternalDestination(std::filesystem::path const& destination) const
         {
             if (destination.empty()) throw std::invalid_argument("Destination is empty");
@@ -469,24 +560,28 @@ namespace HidHide::Profiles
             auto attributes = ::GetFileAttributesW(m_Root.c_str()); if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY) || attributes & FILE_ATTRIBUTE_REPARSE_POINT)
                 throw std::runtime_error("Profile repository root must be a real directory");
         }
-        static void WriteDurable(std::filesystem::path const& path, std::string const& bytes, bool createNew = true)
+        static void WriteDurable(std::filesystem::path const& path, std::string const& bytes, bool createNew = true, std::function<void()> const& partiallyWritten = {})
         {
             HANDLE file = ::CreateFileW(path.c_str(), GENERIC_WRITE | GENERIC_READ, 0, nullptr, createNew ? CREATE_NEW : CREATE_ALWAYS,
                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
             if (file == INVALID_HANDLE_VALUE) throw std::system_error(::GetLastError(), std::system_category(), "Create repository file");
-            DWORD written{}; bool ok = (bytes.empty() || (::WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) && written == bytes.size())) && ::FlushFileBuffers(file);
+            auto write = [&](char const* data, std::size_t size)
+            { DWORD written{}; return size == 0 || (::WriteFile(file, data, static_cast<DWORD>(size), &written, nullptr) && written == size); };
+            auto half = partiallyWritten ? bytes.size() / 2 : 0; bool ok = write(bytes.data(), half);
+            if (ok && partiallyWritten) try { partiallyWritten(); } catch (...) { ::CloseHandle(file); throw; }
+            ok = ok && write(bytes.data() + half, bytes.size() - half) && ::FlushFileBuffers(file);
             auto error = ok ? ERROR_SUCCESS : ::GetLastError(); ::CloseHandle(file); if (!ok) throw std::system_error(error, std::system_category(), "Flush repository file");
         }
-        static bool IsDigest(std::wstring const& value, bool emptyAllowed = false)
+        // Transaction records become visible only when complete: a crash while
+        // writing leaves at most the ".new" staging file, never a torn record.
+        static std::filesystem::path RecordStaging(std::filesystem::path path) { path += L".new"; return path; }
+        void WriteRecordDurable(std::filesystem::path const& path, std::string const& bytes, CommitBoundary partiallyWritten)
         {
-            if (emptyAllowed && value.empty()) return true;
-            if (value.size() != 64) return false;
-            return std::all_of(value.begin(), value.end(), [](wchar_t c) { return (c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f'); });
-        }
-        static bool IsTargetName(std::wstring const& name)
-        {
-            if (name == L"settings.json") return true;
-            return name.size() == 41 && name.substr(36) == L".json" && IsStableId(name.substr(0, 36));
+            auto staging = RecordStaging(path);
+            DeleteChecked(staging, "Remove stale repository transaction record");
+            WriteDurable(staging, bytes, true, [&] { Fire(partiallyWritten, 0); });
+            if (!::MoveFileExW(staging.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH))
+                throw std::system_error(::GetLastError(), std::system_category(), "Publish repository transaction record");
         }
         static void DeleteChecked(std::filesystem::path const& path, char const* operation)
         {
@@ -500,30 +595,10 @@ namespace HidHide::Profiles
             for (auto const& item : items) out << (item.existed ? 1 : 0) << L'\t' << (item.remove ? 1 : 0) << L'\t' << item.fileName << L'\t' << item.tempName << L'\t' << item.backupName << L'\t' << item.sha256 << L'\t' << item.oldSha256 << L'\n';
             return Json::ToUtf8(out.str());
         }
-        static ParsedIntent ParseIntent(std::string const& bytes)
-        {
-            auto text = Json::FromUtf8(bytes); std::wistringstream in(text); std::wstring line;
-            if (!std::getline(in, line) || line.rfind(L"HIDHIDE-PROFILES-TRANSACTION-1\t", 0) != 0) throw std::runtime_error("Invalid repository transaction record");
-            ParsedIntent result; result.transaction = line.substr(31); if (!IsStableId(result.transaction)) throw std::runtime_error("Invalid repository transaction id");
-            std::set<std::wstring> targets;
-            while (std::getline(in, line))
-            {
-                if (line.empty()) continue; std::vector<std::wstring> fields; std::size_t start{};
-                for (std::size_t i{}; i <= line.size(); ++i) if (i == line.size() || line[i] == L'\t') { fields.emplace_back(line.substr(start, i - start)); start = i + 1; }
-                auto index = result.items.size(); auto expectedTemp = L"." + result.transaction + L"." + std::to_wstring(index) + L".tmp"; auto expectedBackup = L"." + result.transaction + L"." + std::to_wstring(index) + L".bak";
-                if (fields.size() != 7 || (fields[0] != L"0" && fields[0] != L"1") || (fields[1] != L"0" && fields[1] != L"1")
-                    || !IsTargetName(fields[2]) || fields[3] != expectedTemp || fields[4] != expectedBackup || !IsDigest(fields[5], fields[1] == L"1")
-                    || !IsDigest(fields[6], fields[0] == L"0")) throw std::runtime_error("Invalid repository transaction item");
-                result.items.push_back({ fields[2], fields[3], fields[4], fields[5], fields[6], fields[0] == L"1", fields[1] == L"1" });
-                if (!targets.emplace(fields[2]).second) throw std::runtime_error("Duplicate repository transaction target");
-                if (result.items.size() > MaxTransactionItems) throw std::runtime_error("Repository transaction is too large");
-            }
-            if (result.items.empty()) throw std::runtime_error("Empty repository transaction"); return result;
-        }
         void CommitLocked(std::vector<Change> const& changes)
         {
             if (changes.empty() || changes.size() > MaxTransactionItems) throw std::invalid_argument("Repository transaction is empty or too large");
-            m_CleanupPending = false;
+            m_CleanupPending = false; m_InjectedCrash = false;
             struct VerificationHandles
             {
                 std::vector<HANDLE> values;
@@ -549,7 +624,22 @@ namespace HidHide::Profiles
                 items.push_back(std::move(item));
             }
             auto intentPath = m_Root / L".transaction.intent"; auto committedPath = m_Root / L".transaction.committed";
-            WriteDurable(intentPath, IntentBytes(transaction, items)); Fire(CommitBoundary::IntentFlushed, 0);
+            // Until the commit marker is durable the old set is authoritative.
+            // An ordinary failure (for example a sharing violation) rolls back
+            // in this process, so the repository is not left blocked until the
+            // next start. Injected crashes keep their evidence for recovery.
+            struct RollbackOnFailure
+            {
+                ProfileRepository& repository; VerificationHandles& verification; int exceptions{ std::uncaught_exceptions() }; bool armed{ true };
+                ~RollbackOnFailure()
+                {
+                    if (!armed || std::uncaught_exceptions() <= exceptions || std::exchange(repository.m_InjectedCrash, false)) return;
+                    for (auto value : verification.values) ::CloseHandle(value);
+                    verification.values.clear();
+                    try { repository.RecoverLocked(); } catch (...) {} // Evidence stays for the next writer or start.
+                }
+            } rollback{ *this, verification };
+            WriteRecordDurable(intentPath, IntentBytes(transaction, items), CommitBoundary::IntentPartiallyWritten); Fire(CommitBoundary::IntentFlushed, 0);
             for (std::size_t i{}; i < items.size(); ++i)
             {
                 auto const& item = items[i]; auto target = m_Root / item.fileName;
@@ -594,7 +684,7 @@ namespace HidHide::Profiles
                     throw RepositoryConflict("Repository target changed before transaction commit");
             }
             Fire(CommitBoundary::SetVerified, 0);
-            WriteDurable(committedPath, Json::ToUtf8(transaction));
+            WriteRecordDurable(committedPath, Json::ToUtf8(transaction), CommitBoundary::CommitMarkPartiallyWritten); rollback.armed = false;
             // A deleted path cannot be protected by an open sharing handle.
             // Recheck the entire set after the durable linearization marker so
             // a recreation racing SetVerified is classified as incomplete
@@ -648,6 +738,8 @@ namespace HidHide::Profiles
                     if (ec) throw std::system_error(ec, "Remove orphaned repository staging file");
                 }
                 if (ec) throw std::system_error(ec, "Enumerate repository staging files");
+                DeleteChecked(RecordStaging(intentPath), "Remove unpublished repository transaction intent");
+                DeleteChecked(RecordStaging(committedPath), "Remove unpublished repository commit marker");
                 return;
             }
             auto parsed = ParseIntent(ReadBytes(intentPath)); auto const& items = parsed.items; bool committed = std::filesystem::exists(committedPath);
@@ -691,6 +783,10 @@ namespace HidHide::Profiles
                 for (std::size_t index{}; index < items.size(); ++index)
                 {
                     auto const& item = items[index]; auto target = m_Root / item.fileName; auto backup = m_Root / item.backupName;
+                    // A target never replaced already holds its old bytes and
+                    // needs no restore (it may still be locked by a reader).
+                    if (item.existed && std::filesystem::exists(target) && Sha256(ReadBytes(target)) == item.oldSha256)
+                    { Fire(CommitBoundary::RecoveryTargetRestored, index); continue; }
                     if (item.existed)
                     {
                         // Preserve the only trusted backup across every retry.
@@ -723,9 +819,10 @@ namespace HidHide::Profiles
                 DeleteChecked(m_Root / item.backupName, "Remove recovered repository backup");
             }
             DeleteChecked(intentPath, "Remove recovered repository intent"); DeleteChecked(committedPath, "Remove recovered repository commit marker");
+            DeleteChecked(RecordStaging(committedPath), "Remove unpublished repository commit marker");
         }
         FailureHook m_FailureHook;
-        bool m_CleanupPending{};
+        bool m_CleanupPending{}, m_InjectedCrash{};
     };
 
     inline std::filesystem::path DefaultRepositoryRoot()

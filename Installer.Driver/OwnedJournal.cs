@@ -6,14 +6,16 @@ public sealed class OwnedJournal<TLease> : IDisposable where TLease : IDisposabl
 {
     public TLease Lease { get; }
     public TransactionRecord Record { get; }
-    public OwnedJournal(Func<TLease> acquire, Func<TransactionRecord> load)
+    // allowCommitted is only for a recovery run that must close a transaction
+    // whose marker outlived its commit; nothing else may act on a committed one.
+    public OwnedJournal(Func<TLease> acquire, Func<TransactionRecord> load, bool allowCommitted = false)
     {
         Lease = acquire();
         try
         {
             Record = load();
             ProtectedJournal.Validate(Record);
-            if (Record.Status == JournalStatus.Committed)
+            if (Record.Status == JournalStatus.Committed && !allowCommitted)
                 throw new InvalidOperationException("The driver transaction has already committed.");
         }
         catch { Lease.Dispose(); throw; }

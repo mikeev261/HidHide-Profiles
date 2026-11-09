@@ -36,8 +36,18 @@ last. IOCTLs are not atomic. Cached confirmed state advances only after read-bac
 Unexpected state during an override or pending recovery latches a conflict. The
 manager stops reconciliation, rejects CLI writes, and retains recovery data. The
 tray offers an explicit action to accept actual driver settings as the new baseline
-and remain paused. This action gives up the prior restoration claim; it does not
-write the old baseline over external edits. Ordinary external edits when no override
+and remain paused. This action does not write the old baseline over external edits.
+When a trustworthy record of what HidHide Profiles applied exists (in-process, or a
+parseable same-user recovery record even if it no longer matches the driver), only
+what changed outside HidHide Profiles is accepted: each driver flag, and each
+blacklist or whitelist entry, takes the observed value where it differs from both
+states HidHide Profiles recorded for its last attempt (what it held before, and what
+it requested; a failed commit can leave either, or part of each) and otherwise keeps
+the original baseline. Profile hiding therefore
+never becomes the baseline, and the recovery record is replaced, not cleared, while
+the driver still holds it. Without such a record (legacy, unreadable or foreign
+evidence) the observed settings become the baseline as a whole and the prior
+restoration claim is given up. Ordinary external edits when no override
 or recovery is pending are adopted as baseline. An exit requesting restoration
 stays resident and reports an error if restoration cannot be confirmed.
 
@@ -54,6 +64,26 @@ requests. Both peers verify the same Windows user SID; the pipe DACL permits tha
 user, rejects remote clients, and uses a first-instance claim. The global mutex
 permits authenticated users to synchronize ownership, but does not grant them
 access to another user's pipe or profile definitions.
+
+Other local users and named objects:
+
+- The per-user profile repository is serialized by an exclusive
+  `<repository>.writer.lock` file next to that user's repository directory (in
+  their own LocalAppData), not by a predictable `Global\` name that another user
+  could pre-create or deny. It is kept outside the repository directory, whose
+  change notifications make the engine reload.
+- The MSI handshake events (`Global\HidHide.Profiles.Msi.Ready/Release.<transaction>`)
+  may be signalled only by the initiating user, SYSTEM and Administrators.
+- Elevated setup moves aside any `C:\ProgramData\mikeev261\HidHide\Maintenance`
+  path component that is not a trusted protected directory (another user may
+  create ProgramData children), keeps it as evidence, and recreates it protected.
+- The machine-wide coordination objects (owner and admission mutexes, the
+  maintenance barrier event and the configuration pipe) are shared by design:
+  another user's engine or setup may legitimately hold them, which blocks this
+  user until it releases them, and a user can hold them the same way on purpose.
+  That lasts only while their process runs (the objects cannot outlive it), and
+  the pipe client still refuses a server owned by another user. Removing this
+  residual denial of service would need a privileged broker service.
 
 Messages are limited to 1 MiB, 4096 entries per collection, and 32767 UTF-16 code
 units per string. Parsing rejects truncated data, invalid flags, duplicate entries,

@@ -7,6 +7,7 @@ using HidHide::CliParsing::ExtractCommand;
 using HidHide::CliParsing::ExtractCommands;
 using HidHide::CliParsing::ExtractKeyword;
 using HidHide::CliParsing::ExtractString;
+using HidHide::CliParsing::Args;
 
 TEST(CliParsing, ExtractKeyword_basic)
 {
@@ -168,4 +169,14 @@ TEST(CliDispatch, RuntimeHandlerFailurePropagatesWithoutAtomicityPromise)
     }
     EXPECT_EQ(1, fixture.handlers);
     EXPECT_TRUE(fixture.persisted);
+}
+
+TEST(CliParsing, EmptyQuotedArgumentInTheMiddleIsAccepted)
+{
+    // #31: an empty quoted argument followed by more arguments was a syntax error.
+    std::wstring s{ L"cmd \"\" next --other" };
+    auto const cmds{ ExtractCommands(s) };
+    ASSERT_EQ(2u, cmds.size());
+    EXPECT_EQ((Args{ L"cmd", L"", L"next" }), cmds[0]);
+    EXPECT_EQ((Args{ L"other" }), cmds[1]);
 }

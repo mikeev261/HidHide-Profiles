@@ -81,8 +81,9 @@ public static class DirectMsiActions
 
             int.TryParse(session["CLIENTPROCESSID"], out int clientProcessId);
             using var user = new MaintenanceUser(sid, clientProcessId);
-            helper = user.StartMaintenance(id, operation == "uninstall");
-            WaitForReady(id, helper);
+            helper = user.StartMaintenance(id, operation == "uninstall", out var errors);
+            // Released before returning so nothing of this action outlives it.
+            using (errors) WaitForReady(id, helper, errors);
             session[HelperProperty] = helper.Id.ToString(System.Globalization.CultureInfo.InvariantCulture);
             session.Log("HidHide ordinary-user maintenance is ready for protected MSI execution.");
             helper.Dispose(); helper = null;
@@ -107,33 +108,16 @@ public static class DirectMsiActions
             bool recovery = Required(session, RecoveryProperty, allowEmpty: true) == "1";
             using var helperProcess = !recovery && helper > 0 ? Process.GetProcessById(helper) : null;
             if (helperProcess != null) _ = helperProcess.Handle;
-            if (recovery)
-            {
-                bool resume;
-                using (var owned = Own(id))
-                {
-                    var existing = owned.Record;
-                    if (!string.Equals(existing.InitiatingSid, sid, StringComparison.Ordinal)) throw new UnauthorizedAccessException("Maintenance belongs to another Windows user.");
-                    if (OperationName(existing.Operation) != operation) throw new InvalidDataException("Pending maintenance operation does not match this MSI request.");
-                    resume = existing.Status == JournalStatus.RebootRequired || existing.Status == JournalStatus.RollbackRebootRequired;
-                    if (!resume && existing.Status != JournalStatus.Prepared && existing.Status != JournalStatus.Applied)
-                        throw new InvalidOperationException("Pending driver maintenance requires explicit recovery.");
-                } // Child worker needs the same ownership mutex.
-                if (resume)
-                {
-                    int resumed = WorkerProcess.Run("--resume", id, session.Log);
-                    if (resumed == 3010) throw new InvalidOperationException("Another restart is required before setup can continue.");
-                    if (resumed != 0) throw new InvalidOperationException("Protected driver recovery failed with exit code " + resumed + ".");
-                }
-            }
+            var flow = new DirectMsiFlow(new MachineHost(session, helperProcess));
+            if (recovery) flow.ResumePending(id, sid, operation);
             else
             {
                 ValidateHelper(helper, sid, operation);
                 using var lease = new MaintenanceLease(id, createPreparation: helper == 0);
-                PreparePayload();
+                PreparePayload(session.Log);
                 var backend = new WindowsDriverBackend(Path.Combine(ProtectedJournal.Root, "payload"), lease.AssertHeld);
                 var before = backend.Inspect();
-                ValidateStartingState(operation, before);
+                DirectMsiFlow.ValidateStartingState(operation, before);
                 var record = new TransactionRecord
                 {
                     Id = id,
@@ -146,33 +130,7 @@ public static class DirectMsiActions
                 lease.MarkPending(false, operation);
             }
 
-            bool apply;
-            using (var owned = Own(id))
-            {
-                var current = owned.Record;
-                apply = current.Status == JournalStatus.Prepared;
-                if (apply)
-                {
-                    // Durable before dispatch; the worker anchors the work boot.
-                    DriverTransaction.PrepareMsiApply(new ProtectedJournal(id), current);
-                }
-            }
-            if (apply)
-            {
-                int applied = WorkerProcess.Run("--apply", id, session.Log);
-                if (applied != 0 && applied != 3010) throw new InvalidOperationException("Driver maintenance failed with exit code " + applied + ".");
-            }
-            using (var owned = Own(id))
-            {
-                var current = owned.Record;
-                if (current.Status != JournalStatus.Applied && current.Status != JournalStatus.RebootRequired)
-                    throw new InvalidOperationException("Driver transaction did not reach a verified forward checkpoint.");
-                bool restartRequired = DirectMsiPolicy.RequiresRestart(operation, recovery, current.Reboot);
-                owned.Lease.MarkPending(false, operation, restartRequired: restartRequired || current.CommitRebootRequired);
-            }
-            SignalRelease(id); // Confirmed checkpoint; helper can remove owned startup on uninstall.
-            if (helperProcess != null && (!helperProcess.WaitForExit(5000) || helperProcess.ExitCode != 0))
-                throw new InvalidOperationException("Configuration maintenance did not finish successfully. Recovery information was retained.");
+            flow.Apply(id, operation, recovery);
             session.Log("HidHide protected driver phase completed; Windows Installer owns reboot continuation.");
             return ActionResult.Success;
         }
@@ -188,39 +146,11 @@ public static class DirectMsiActions
     {
         try
         {
-            var id = Id(session); var journal = new ProtectedJournal(id); bool resume;
-            using (var snapshot = Own(id)) resume = snapshot.Record.Status == JournalStatus.RebootRequired;
-            if (resume)
+            if (new DirectMsiFlow(new MachineHost(session)).Finalize(Id(session)))
             {
-                int result = WorkerProcess.Run("--resume", id, session.Log);
-                if (result != 0) throw new InvalidOperationException("Post-restart driver continuation failed with exit code " + result + ".");
+                session.SetMode(InstallRunMode.RebootAtEnd, true);
+                session.Log("HidHide restored driver filters that take effect after the restart requested at the end of setup.");
             }
-            using var owned = Own(id);
-            var record = owned.Record;
-            if (record.Status != JournalStatus.Applied) throw new InvalidOperationException("Driver transaction did not reach its verified applied state.");
-            var lease = owned.Lease;
-            var backend = new WindowsDriverBackend(Path.Combine(ProtectedJournal.Root, "payload"), lease.AssertHeld);
-            // The MSI may force a restart even when native APIs returned Applied.
-            // AFTERREBOOT/format differences alone never prove that it occurred.
-            if (!new DriverTransaction(backend, journal, record).VerifyCommitRestart(BootIdentity.Current()))
-                throw new InvalidOperationException("Legacy restart evidence was preserved and anchored. Restart Windows again before continuing setup.");
-            var actual = backend.Inspect();
-            if (record.Operation == Operation.Uninstall)
-            {
-                if (!actual.Empty) throw new InvalidOperationException("Driver resources remain after uninstall.");
-            }
-            else
-            {
-                if (!actual.Healthy || actual.Settings == null) throw new InvalidOperationException("Installed driver did not verify as healthy.");
-                if (record.Operation == Operation.Repair && !record.Before.CoreHealthy && record.Before.Settings != null)
-                {
-                    var expected = DriverTransaction.ExpectedAfterBinding(record.Before.Settings);
-                    backend.RestoreSettings(expected, record.Before.Settings);
-                }
-            }
-            record = journal.Load();
-            record.Status = JournalStatus.Committed; record.Reboot = false; journal.Save(record);
-            lease.Complete();
             session.Log("HidHide driver transaction committed and maintenance exclusion cleared.");
             return ActionResult.Success;
         }
@@ -249,33 +179,7 @@ public static class DirectMsiActions
             // A new MSI attempt must not undo a protected transaction that
             // began in a previous attempt (including a pre-restart retry).
             if (Required(session, RecoveryProperty, allowEmpty: true) == "1") return ActionResult.Success;
-            var id = Id(session); SignalRelease(id);
-            if (!MarkerMatches(id)) return ActionResult.Success;
-            var journal = new ProtectedJournal(id);
-            using (var owned = Own(id))
-            {
-                var record = owned.Record;
-                if (record.Status == JournalStatus.Prepared)
-                {
-                    if (record.Steps.Count != 0 || record.Reboot)
-                        throw new InvalidOperationException("Prepared rollback contains native work evidence.");
-                    record.Status = JournalStatus.Committed; journal.Save(record); owned.Lease.Complete();
-                    return ActionResult.Success;
-                }
-            }
-            int result = WorkerProcess.Run("--rollback", id, session.Log);
-            if (result == 3010)
-            {
-                session.Log("HidHide rollback requires a restart; protected recovery evidence was retained.");
-                return ActionResult.Success;
-            }
-            if (result != 0) throw new InvalidOperationException("Driver rollback failed with exit code " + result + ".");
-            using (var owned = Own(id))
-            {
-                var record = owned.Record;
-                if (record.Status != JournalStatus.RolledBack) throw new InvalidOperationException("Driver rollback did not verify.");
-                record.Status = JournalStatus.Committed; record.Reboot = false; journal.Save(record); owned.Lease.Complete();
-            }
+            new DirectMsiFlow(new MachineHost(session)).Rollback(Id(session));
             return ActionResult.Success;
         }
         catch (Exception error)
@@ -285,9 +189,6 @@ public static class DirectMsiActions
         }
     }
 
-    static OwnedJournal<MaintenanceLease> Own(Guid id) =>
-        new(() => new MaintenanceLease(id, recovery: true), () => new ProtectedJournal(id).Load());
-
     static string RequestedOperation(Session session)
     {
         if (session["HIDHIDE_UNINSTALL"] == "1") return "uninstall";
@@ -295,31 +196,55 @@ public static class DirectMsiActions
         if (!string.IsNullOrEmpty(session["WIX_UPGRADE_DETECTED"])) return "upgrade";
         return string.IsNullOrEmpty(session["Installed"]) ? "install" : "repair";
     }
-    static string OperationName(Operation operation) => operation switch
-    { Operation.Install => "install", Operation.Repair => "repair", Operation.Uninstall => "uninstall", Operation.Upgrade => "upgrade", _ => throw new InvalidDataException("Unknown driver operation.") };
-    static void ValidateStartingState(string operation, DriverState state)
+    // Production resources for DirectMsiFlow: the protected journal, durable
+    // marker, elevated worker and the installed driver behind the lease.
+    sealed class MachineHost : IDirectMsiHost
     {
-        if (state.ServicePendingDeletion) throw new DriverRestartRequiredException();
-        if (operation == "install" && !state.CanInstall) throw new InvalidOperationException("A clean installation requires no existing HidHide driver resources.");
-        if (operation == "uninstall" && !state.CoreHealthy) throw new InvalidOperationException("Uninstall requires the installed signed driver to be healthy.");
-        if (operation is "repair" or "upgrade" && !(state.CoreHealthy || operation == "repair" && state.Repairable))
-            throw new InvalidOperationException("The existing driver state is not safe for in-place maintenance.");
+        readonly Session session;
+        readonly Process? helper;
+        public MachineHost(Session session, Process? helper = null) { this.session = session; this.helper = helper; }
+        public bool WaitForHelper(int milliseconds) => helper == null || helper.WaitForExit(milliseconds) && helper.ExitCode == 0;
+        public IDirectMsiLease Own(Guid id, bool allowCommitted = false) => new MachineLease(id, allowCommitted);
+        public void Save(TransactionRecord record) => new ProtectedJournal(record.Id).Save(record);
+        public int RunWorker(string verb, Guid id) => WorkerProcess.Run(verb, id, session.Log);
+        public bool MarkerMatches(Guid id) => DirectMsiActions.MarkerMatches(id);
+        public string CurrentBoot() => BootIdentity.Current();
+        public void SignalRelease(Guid id) => DirectMsiActions.SignalRelease(id);
+        public void Log(string message) => session.Log(message);
     }
-    static void WaitForReady(Guid id, Process helper)
+    sealed class MachineLease : IDirectMsiLease
     {
-        var deadline = DateTime.UtcNow.AddSeconds(20);
-        while (DateTime.UtcNow < deadline)
+        // The journal snapshot is loaded only after the lease is held.
+        readonly OwnedJournal<MaintenanceLease> owned;
+        readonly ProtectedJournal journal;
+        readonly WindowsDriverBackend backend;
+        public MachineLease(Guid id, bool allowCommitted)
         {
-            if (helper.HasExited) throw new InvalidOperationException("The configuration helper exited before confirming readiness (code " + helper.ExitCode + "). Open HidHide Profiles, resolve any pending recovery or ownership message, then retry setup.");
-            try
-            {
-                using var ready = EventWaitHandle.OpenExisting(EventName("Ready", id));
-                if (ready.WaitOne(250)) return;
-            }
-            catch (WaitHandleCannotBeOpenedException) { Thread.Sleep(100); }
+            journal = new ProtectedJournal(id);
+            owned = new OwnedJournal<MaintenanceLease>(() => new MaintenanceLease(id, recovery: true), journal.Load, allowCommitted);
+            backend = new WindowsDriverBackend(Path.Combine(ProtectedJournal.Root, "payload"), owned.Lease.AssertHeld);
         }
-        throw new TimeoutException("Configuration maintenance did not become ready.");
+        public TransactionRecord Record => owned.Record;
+        public TransactionRecord Reload() => journal.Load();
+        public void MarkPending(string operation, bool restartRequired) => owned.Lease.MarkPending(false, operation, restartRequired: restartRequired);
+        public DriverState Inspect() => backend.Inspect();
+        public bool VerifyCommitRestart(TransactionRecord record, string currentBootId) =>
+            new DriverTransaction(backend, journal, record).VerifyCommitRestart(currentBootId);
+        public void RestoreSettings(DriverSettings expected, DriverSettings desired) => backend.RestoreSettings(expected, desired);
+        public void Complete() => owned.Lease.Complete();
+        public void Dispose() => owned.Dispose();
     }
+    // A helper that exits early reports its reason (e.g. the editor is open)
+    // through its private stderr pipe; ReportFailure shows and logs it.
+    static void WaitForReady(Guid id, Process helper, HelperErrorOutput errors) => HelperReadiness.Wait(helper, errors, () =>
+    {
+        try
+        {
+            using var ready = EventWaitHandle.OpenExisting(EventName("Ready", id));
+            return ready.WaitOne(250);
+        }
+        catch (WaitHandleCannotBeOpenedException) { Thread.Sleep(100); return false; }
+    }, TimeSpan.FromSeconds(20));
     static void ValidateHelper(int pid, string sid, string operation)
     {
         if (!DirectMsiPolicy.NeedsResidentHelper(operation, recovery: false))
@@ -368,20 +293,11 @@ public static class DirectMsiActions
         foreach (var sid in new[] { Admins, SystemSid }) acl.AddAccessRule(new FileSystemAccessRule(sid, FileSystemRights.FullControl, AccessControlType.Allow));
         return acl;
     }
-    static void PreparePayload()
+    static void PreparePayload(Action<string> log)
     {
-        ProtectedJournal.CreateRoot();
+        ProtectedJournal.CreateRoot(log);
         string target = Path.Combine(ProtectedJournal.Root, "payload");
-        if (Directory.Exists(target))
-        {
-            ProtectedJournal.ValidateDirectory(target);
-            foreach (string name in new[] { "HidHide.inf", "HidHide.sys", "hidhide.cat", "LICENSE.rtf" })
-                ProtectedJournal.ValidateAcl(File.GetAccessControl(Path.Combine(target, name)));
-            Payload.Verify(target);
-            return;
-        }
         string source = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "HidHide", "Driver");
-        ProtectedJournal.RejectReparsePath(source); Payload.Verify(source);
         if (!Directory.Exists(target))
         {
             var acl = new DirectorySecurity(); acl.SetAccessRuleProtection(true, false); acl.SetOwner(Admins);
@@ -390,17 +306,9 @@ public static class DirectMsiActions
             Directory.CreateDirectory(target, acl);
         }
         ProtectedJournal.ValidateDirectory(target);
-        foreach (string name in new[] { "HidHide.inf", "HidHide.sys", "hidhide.cat", "LICENSE.rtf" })
-        {
-            string destination = Path.Combine(target, name);
-            if (!File.Exists(destination))
-            {
-                using var input = new FileStream(Path.Combine(source, name), FileMode.Open, FileAccess.Read, FileShare.Read);
-                using var output = new FileStream(destination, FileMode.CreateNew, FileSystemRights.Write, FileShare.None, 4096, FileOptions.WriteThrough, FileAcl());
-                input.CopyTo(output); output.Flush(true);
-            }
-            ProtectedJournal.ValidateAcl(File.GetAccessControl(destination));
-        }
+        PayloadCache.Prepare(source, target, Payload.Files,
+            path => new FileStream(path, FileMode.CreateNew, FileSystemRights.Write, FileShare.None, 4096, FileOptions.WriteThrough, FileAcl()),
+            path => ProtectedJournal.ValidateAcl(File.GetAccessControl(path)));
         Payload.Verify(target);
     }
 

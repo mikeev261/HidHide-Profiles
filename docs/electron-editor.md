@@ -27,6 +27,9 @@ the separate action that restores the baseline and stops the native coordinator.
   Repository revision/hash checks prevent an old draft overwriting newer files.
 - Import and duplication produce unsaved copies. Allowed apps remain global.
   Recovery adoption stages changed allowed applications for explicit review.
+  When no profile file exists yet (for example stale recovery evidence on first
+  start), adoption instead creates the catalog from the adopted Allowed apps;
+  an incomplete or corrupt catalog still requires repair or restore first.
 - Normal desktop layouts retain the profile rail and save bar. Narrow or short
   effective viewports reflow to one scroll surface with a Profiles toggle. Zoom
   does not hide actions; dialogs scroll and trap focus with Escape to return.
