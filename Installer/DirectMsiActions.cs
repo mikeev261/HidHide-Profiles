@@ -146,11 +146,11 @@ public static class DirectMsiActions
     {
         try
         {
+            // The transaction is committed once Finalize returns, so nothing after
+            // it may fail setup. A deferred action cannot set installer modes
+            // (Session.SetMode throws here), so the restart is only recorded.
             if (new DirectMsiFlow(new MachineHost(session)).Finalize(Id(session)))
-            {
-                session.SetMode(InstallRunMode.RebootAtEnd, true);
-                session.Log("HidHide restored driver filters that take effect after the restart requested at the end of setup.");
-            }
+                session.Log("HidHide attached driver class filters that take effect after the next Windows restart. Restart Windows to finish activating device hiding.");
             session.Log("HidHide driver transaction committed and maintenance exclusion cleared.");
             return ActionResult.Success;
         }

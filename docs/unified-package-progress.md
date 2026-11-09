@@ -1,3 +1,33 @@
+## September audit fixes integrated — 2026-11-09
+
+The fixes for the 2026-09-25 audit (items #1–#14, #16–#34, N1, D1–D4) are merged
+onto master on branch `fix/september-audit-integration`. #15 and #35 keep
+master's implementations (issues 34 and 37). The public MSI custom actions now
+delegate to `Installer/DirectMsiFlow.cs`, which carries the issue-37 ownership,
+restart-obligation and commit-restart rules; the `artifacts/issue-37-r4` evidence
+predates that rewrite. Changes made while integrating:
+
+- The repository writer lock is created once and left in place, and taking the
+  lease creates no directory. Master's watcher covers the repository's parent,
+  so the earlier create-and-delete lock made every reload trigger the next.
+- An unchanged transaction is closed only when no native call can still be in
+  flight, and its unacknowledged steps are dropped so the marker can clear. An
+  interrupted journal with legacy boot evidence is anchored first.
+- The post-restart continuation is modelled as Windows Installer runs it: a
+  recovery pass through ApplyDriver. #17 now completes there, and a repair
+  whose commit failed after its baseline was restored can resume.
+- Rollback recovery of the profile catalog removes its intent before its
+  staging files, so an interrupted cleanup cannot block the catalog, and
+  orphaned staging files no longer count as catalog evidence.
+
+Known gaps: setup logs but does not request the restart that activates newly
+attached class filters (#2, #17); a committed transaction whose marker outlived a
+real driver change still needs manual recovery.
+
+Status: driver-free native, managed and editor suites pass and the unified Ci
+target builds the MSI. Nothing here was run against an installed driver, on a VM,
+or through a real restart, and it does not establish public release readiness.
+
 ## Issue #37 ownership and interruption repair — 2026-10-03
 
 The MSI restart obligation is now durable before worker dispatch, including

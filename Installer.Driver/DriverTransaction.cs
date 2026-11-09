@@ -236,14 +236,16 @@ public sealed partial class DriverTransaction
         BootIdentity.Stable(currentBootId) && BootIdentity.Stable(record.BootId) &&
         (string.IsNullOrEmpty(record.RestartAnchor) ? record.BootId : record.RestartAnchor) == currentBootId;
 
-    // A transaction proven unchanged is closed without native work. A step
-    // whose native call was never acknowledged had no effect, so it is not
-    // carried into the committed record that clears the maintenance marker.
+    // Only for a transaction already proven Unchanged: the driver is observed
+    // exactly as before and no native call can still be in flight. A step whose
+    // call was never acknowledged then had no effect, so it is not carried into
+    // the committed record that clears the maintenance marker.
     public static void DiscardUnappliedSteps(TransactionRecord record) => record.Steps.RemoveAll(x => !x.Completed);
 
     // A retained healthy driver whose only changes are verified class-filter
     // additions may commit before the restart that activates them. Upgrades
-    // never force a mid-setup restart; Windows Installer restarts at the end.
+    // never force a mid-setup restart; the filters take effect after the next
+    // restart, which setup logs but does not request.
     // An operation that still owes a verified restart never commits this way.
     public static bool CanCommitBeforeRestart(TransactionRecord record, DriverState observed)
     {
@@ -301,7 +303,10 @@ public sealed partial class DriverTransaction
                 !string.Equals(state.Packages[0], expectedInf, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("Installed driver did not become healthy after reboot.");
             var defaults = ExpectedAfterBinding(Reconstructing ? record.Before.Settings : null);
-            if (state.Settings == null || !state.Settings.Same(defaults))
+            // A repair whose commit failed after its baseline was restored resumes
+            // with that baseline already in place; restoration tolerates it too.
+            bool restored = Reconstructing && record.Before.Settings != null && state.Settings != null && state.Settings.Same(record.Before.Settings);
+            if (state.Settings == null || !(state.Settings.Same(defaults) || restored))
                 throw new InvalidOperationException("Fresh driver settings changed before baseline restoration.");
         }
         else if (record.Operation == Operation.Uninstall)

@@ -68,10 +68,22 @@ public sealed class DirectMsiFlow
             }
         } // Child worker needs the same ownership mutex.
         int resumed = host.RunWorker("--resume", id);
-        if (resumed == 3010) throw new InvalidOperationException("Another restart is required before setup can continue.");
-        if (resumed != 0) throw new InvalidOperationException("Protected driver recovery failed with exit code " + resumed + ".");
+        if (resumed != 0 && resumed != 3010) throw new InvalidOperationException("Protected driver recovery failed with exit code " + resumed + ".");
         using (var owned = host.Own(id, allowCommitted: true))
+        {
+            if (resumed == 3010)
+            {
+                // Windows Installer runs the whole sequence again after its
+                // forced restart, so this is where the continuation happens. One
+                // that verified the restart and then attached class filters is
+                // complete apart from the restart that activates them: Finalize
+                // commits it. Anything else still needs a restart first.
+                if (!DriverTransaction.CanCommitAfterResume(owned.Record, owned.Inspect(), host.CurrentBoot()))
+                    throw new InvalidOperationException("Another restart is required before setup can continue.");
+                return;
+            }
             if (owned.Record.Status != JournalStatus.Prepared && owned.Record.Status != JournalStatus.Applied) CloseTerminal(owned);
+        }
     }
 
     // A previous attempt that ended rolled back, or whose resources are
@@ -80,9 +92,17 @@ public sealed class DirectMsiFlow
     void CloseTerminal(IDirectMsiLease owned)
     {
         var record = owned.Record;
-        bool terminal = record.Status == JournalStatus.RolledBack ||
-            record.Status is JournalStatus.Committed or JournalStatus.RecoveryRequired or JournalStatus.Applying or JournalStatus.RollingBack &&
-            DriverTransaction.Unchanged(record, owned.Inspect());
+        bool terminal = record.Status == JournalStatus.RolledBack;
+        if (!terminal && record.Status is JournalStatus.Committed or JournalStatus.RecoveryRequired or JournalStatus.Applying or JournalStatus.RollingBack)
+        {
+            var observed = owned.Inspect(); string boot = host.CurrentBoot();
+            terminal = DriverTransaction.Unchanged(record, observed, boot);
+            if (!terminal && DriverTransaction.UnchangedPendingRestart(record, observed, boot))
+            {
+                DriverTransaction.AnchorLegacyInterruption(new HostJournal(host), record, boot);
+                throw new InvalidOperationException("A previous setup was interrupted during a driver operation whose outcome is not certain yet. Restart Windows, then run setup again.");
+            }
+        }
         if (!terminal) throw new InvalidOperationException("Pending driver maintenance requires explicit recovery.");
         // Completion requires every recorded step to be acknowledged; a step
         // that never was had no effect on a state proven unchanged.
@@ -136,30 +156,20 @@ public sealed class DirectMsiFlow
     public bool Finalize(Guid id)
     {
         string boot = host.CurrentBoot();
-        bool restartAtEnd, resume, resumed = false;
-        using (var snapshot = host.Own(id))
-        {
-            // Without an intervening restart (upgrades never force one) a
-            // continuation cannot run; only a verified filter-only change commits.
-            restartAtEnd = snapshot.Record.Status == JournalStatus.RebootRequired && DriverTransaction.SameBootAsWork(snapshot.Record, boot);
-            resume = snapshot.Record.Status == JournalStatus.RebootRequired && !restartAtEnd;
-        } // Child worker needs the same ownership mutex.
-        if (resume)
-        {
-            int result = host.RunWorker("--resume", id);
-            // The continuation may itself attach filters, which take effect only
-            // after another restart; that restart is requested at the end.
-            if (result == 3010) restartAtEnd = resumed = true;
-            else if (result != 0) throw new InvalidOperationException("Post-restart driver continuation failed with exit code " + result + ".");
-        }
         using var owned = host.Own(id);
         var record = owned.Record;
+        // Any continuation after a restart already ran in ApplyDriver's recovery
+        // pass (ResumePending). A transaction that still awaits a restart here
+        // did its last work in this boot; it commits only when that restart is
+        // needed for nothing but activating verified class filters.
+        bool restartAtEnd = record.Status == JournalStatus.RebootRequired;
         if (record.Status != JournalStatus.Applied && !restartAtEnd) throw new InvalidOperationException("Driver transaction did not reach its verified applied state.");
         DriverState actual;
         if (restartAtEnd)
         {
             actual = owned.Inspect();
-            if (!(resumed ? DriverTransaction.CanCommitAfterResume(record, actual, boot) : DriverTransaction.CanCommitBeforeRestart(record, actual)))
+            if (!DriverTransaction.SameBootAsWork(record, boot) ||
+                !(DriverTransaction.CanCommitBeforeRestart(record, actual) || DriverTransaction.CanCommitAfterResume(record, actual, boot)))
                 throw new InvalidOperationException("Driver maintenance requires a restart before setup can finish.");
         }
         else

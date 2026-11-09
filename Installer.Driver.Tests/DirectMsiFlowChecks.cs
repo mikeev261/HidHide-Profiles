@@ -27,7 +27,73 @@ static class DirectMsiFlowChecks
         DisabledDriverCanBeUninstalled();
         ReconstructingRepairWithMissingFilterFinishesInOneAttempt();
         SlowHelperAfterCompletedUninstallDoesNotFailSetup();
+        WorkerKilledMidCallIsClosedOnlyAfterARestartProvesNothingLanded();
+        LegacyInterruptedTransactionIsAnchoredThenClosedAfterOneRestart();
+        RepairCommitFailureAfterRestoredBaselineFinishesAfterARestart();
         return checks;
+    }
+
+    // An interrupted journal from before stable boot identities can never prove
+    // a restart from its clock value. The first recovery run records the current
+    // boot as its anchor; the run after the next restart can then close it.
+    static void LegacyInterruptedTransactionIsAnchoredThenClosedAfterOneRestart()
+    {
+        var host = new FlowHost(new Fake()) { KillNextWorkerMidCall = true }; host.Backend.Fail = "stage";
+        host.Msi("install");
+        var legacy = host.Last; legacy.Schema = 1; legacy.CommitRebootRequired = false; legacy.BootId = "638900000000000000"; legacy.RestartAnchor = ""; host.Save(legacy);
+        host.Reboot(); host.Reboot(); // Any number of restarts: legacy evidence cannot show them.
+        var first = host.Msi("install");
+        Check(!first.Succeeded && first.Failure.Contains("Restart Windows") && host.Marker != null && host.Last.Schema == 2 && host.Last.RestartAnchor == host.CurrentBoot() && host.Last.BootId == "638900000000000000",
+            "legacy interruption is anchored in the current boot and keeps its evidence: " + first.Failure);
+        Check(!host.Msi("install").Succeeded && host.Marker != null, "a same-boot rerun still waits for the restart");
+        host.Reboot();
+        var closed = host.Msi("install");
+        Check(!closed.Succeeded && closed.Failure.Contains(RunAgain) && host.Marker == null, "one restart after anchoring closes the legacy interruption: " + closed.Failure);
+    }
+
+    // The continuation attached a filter and Finalize restored the repaired
+    // driver's baseline, then the commit failed. After the next restart the
+    // continuation must accept the already restored baseline and finish.
+    static void RepairCommitFailureAfterRestoredBaselineFinishesAfterARestart()
+    {
+        var backend = MissingFilter(1); backend.State.BinaryHash = "";
+        backend.State.Settings = new DriverSettings { Active = true, Inverse = false, Whitelist = SettingsCodec.Encode(new[] { "feeder" }), Blacklist = SettingsCodec.Encode(new[] { "device" }) };
+        var baseline = backend.State.Settings;
+        var host = new FlowHost(backend) { FailCommitOnce = true };
+        var first = host.Msi("repair");
+        Check(!first.Succeeded && host.Marker != null && host.Last.Status == JournalStatus.RebootRequired && backend.State.Settings!.Same(baseline), "the baseline was restored before the commit failed");
+        host.Reboot();
+        var retry = host.Msi("repair");
+        Check(retry.Succeeded && host.Marker == null && host.Last.Status == JournalStatus.Committed, "repair finishes after the restart: " + retry.Failure);
+        Check(backend.State.Healthy && backend.State.Settings!.Same(baseline), "the restored baseline is kept");
+    }
+
+    // A worker killed inside a native call may still see that call land. The
+    // unacknowledged step and the exclusion stay until a restart separates the
+    // observation from the call; then an unchanged driver closes the transaction,
+    // and a changed one keeps its evidence.
+    static void WorkerKilledMidCallIsClosedOnlyAfterARestartProvesNothingLanded()
+    {
+        var host = new FlowHost(new Fake()) { KillNextWorkerMidCall = true }; host.Backend.Fail = "stage";
+        var killed = host.Msi("install");
+        Check(!killed.Succeeded && host.Marker != null && host.Last.Status == JournalStatus.Applying && host.Last.Steps.Count == 1 && !host.Last.Steps[0].Completed,
+            "a worker killed mid-call keeps its step and the exclusion in the same boot");
+        var sameBoot = host.Msi("install");
+        Check(!sameBoot.Succeeded && sameBoot.Failure.Contains("Restart Windows") && host.Marker != null && host.Last.Steps.Count == 1,
+            "a same-boot rerun asks for a restart instead of closing: " + sameBoot.Failure);
+        host.Reboot();
+        var closed = host.Msi("install");
+        Check(!closed.Succeeded && closed.Failure.Contains(RunAgain) && host.Marker == null && host.Last.Steps.Count == 0,
+            "after a restart an unchanged driver closes the transaction: " + closed.Failure);
+        Check(host.Msi("install").Succeeded && host.Backend.State.Healthy, "setup succeeds after the interrupted attempt was closed");
+
+        var landed = new FlowHost(new Fake()) { KillNextWorkerMidCall = true }; landed.Backend.Fail = "stage";
+        landed.Msi("install");
+        landed.Backend.State.Packages = new[] { "oem34.inf" }; // The interrupted staging call completed after the kill.
+        landed.Reboot();
+        var refused = landed.Msi("install");
+        Check(!refused.Succeeded && !refused.Failure.Contains(RunAgain) && landed.Marker != null && landed.Last.Steps.Count == 1,
+            "a call that landed after the kill keeps its evidence: " + refused.Failure);
     }
 
     // #16: a disabled device (problem 22) has no control device, but it is still
@@ -50,7 +116,7 @@ static class DirectMsiFlowChecks
         var host = new FlowHost(backend);
         var run = host.Msi("repair");
         Check(run.Succeeded && host.Marker == null && host.Last.Status == JournalStatus.Committed, "reconstructing repair with a missing filter: " + run.Failure);
-        Check(host.RestartAtEnd && backend.State.Healthy && backend.State.Settings!.Same(baseline), "repair restores the baseline and asks for the filter restart at the end");
+        Check(host.RestartAtEnd && backend.State.Healthy && backend.State.Settings!.Same(baseline), "repair restores the baseline and reports that the filters need a restart");
     }
 
     // #18: the helper's cleanup after release is not part of the driver
@@ -85,13 +151,13 @@ static class DirectMsiFlowChecks
     }
 
     // #2: upgrades never force a mid-setup restart, so a verified filter-only
-    // change on the retained driver commits and asks for a restart at the end.
+    // change on the retained driver commits and reports that a restart is needed.
     static void UpgradeRestoringMissingFilterCommitsAndRestartsAtEnd()
     {
         var host = new FlowHost(MissingFilter(1));
         var run = host.Msi("upgrade");
         Check(run.Succeeded, "upgrade restoring a missing filter succeeds: " + run.Failure);
-        Check(host.RestartAtEnd && host.Boot == "1" && host.Marker == null && host.Last.Status == JournalStatus.Committed, "upgrade commits and requests a restart at the end");
+        Check(host.RestartAtEnd && host.Boot == "1" && host.Marker == null && host.Last.Status == JournalStatus.Committed, "upgrade commits and reports that a restart is needed");
         Check(host.Backend.State.Healthy && host.Backend.State.Settings!.Active && host.Backend.Calls.SequenceEqual(new[] { "filter1" }), "upgrade only restores the missing filter and keeps the baseline");
 
         var changed = new FlowHost(MissingFilter(1)) { AfterApply = backend => backend.State.Filters[0].Entries = new[] { "VendorA", "HidHide", "VendorB", "External" } };
@@ -239,6 +305,9 @@ sealed class FlowHost : IDirectMsiHost
     // Applied to the next worker run: the process is killed after the engine
     // returns, so MSI sees a timeout while the journal holds the real outcome.
     public bool KillNextWorkerAfterRun;
+    // Applied to the next worker run together with Backend.Fail: the process is
+    // killed inside that native call, whose effect is then still undecided.
+    public bool KillNextWorkerMidCall;
     public readonly List<string> Workers = new(), Logs = new();
     readonly Dictionary<Guid, byte[]> journals = new();
     Guid last;
@@ -259,8 +328,16 @@ sealed class FlowHost : IDirectMsiHost
             if (FailBeforeWorker) throw new InvalidOperationException("Injected failure before the driver worker ran.");
             flow.Apply(id, operation, recovery);
             AfterApply?.Invoke(Backend);
-            // ForceReboot: NOT HIDHIDE_RECOVERY AND NOT WIX_UPGRADE_DETECTED.
-            if (!recovery && operation != "upgrade") { Reboot(); rebooted = true; }
+            // ForceReboot: NOT AFTERREBOOT AND NOT HIDHIDE_RECOVERY AND NOT
+            // WIX_UPGRADE_DETECTED. It ends this session before FinalizeDriver.
+            // After the restart Windows Installer runs the sequence again from
+            // the top; the marker makes that pass a recovery run of ApplyDriver.
+            if (!recovery && operation != "upgrade")
+            {
+                Reboot(); rebooted = true;
+                flow.ResumePending(id, Sid, operation);
+                flow.Apply(id, operation, recovery: true);
+            }
             RestartAtEnd = flow.Finalize(id);
             return new MsiRun(true, "");
         }
@@ -318,6 +395,14 @@ sealed class FlowHost : IDirectMsiHost
             code = outcome == JournalStatus.RebootRequired || outcome == JournalStatus.RollbackRebootRequired ? 3010 : 0;
         }
         catch (Exception error) { Logs.Add(verb + ": " + error.Message); code = 1; }
+        if (KillNextWorkerMidCall)
+        {
+            // The process died inside the native call: its catch never ran, so
+            // the journal still says Applying with the step unacknowledged.
+            KillNextWorkerMidCall = false; Backend.Fail = "";
+            var interrupted = Load(id); interrupted.Status = JournalStatus.Applying; interrupted.Failure = ""; Save(interrupted);
+            throw new TimeoutException("Driver worker timed out; outcome is unknown and recovery is required.");
+        }
         if (KillNextWorkerAfterRun) { KillNextWorkerAfterRun = false; throw new TimeoutException("Driver worker timed out; outcome is unknown and recovery is required."); }
         return code;
     }
