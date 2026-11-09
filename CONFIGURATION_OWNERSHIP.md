@@ -70,8 +70,10 @@ Other local users and named objects:
 - The per-user profile repository is serialized by an exclusive
   `<repository>.writer.lock` file next to that user's repository directory (in
   their own LocalAppData), not by a predictable `Global\` name that another user
-  could pre-create or deny. It is kept outside the repository directory, whose
-  change notifications make the engine reload.
+  could pre-create or deny. The empty lock file is created once and left in
+  place; only the open handle is the lock. The engine watches the repository's
+  parent directory, so a lock created and deleted on every read would make each
+  reload trigger the next.
 - The MSI handshake events (`Global\HidHide.Profiles.Msi.Ready/Release.<transaction>`)
   may be signalled only by the initiating user, SYSTEM and Administrators.
 - Elevated setup moves aside any `C:\ProgramData\mikeev261\HidHide\Maintenance`

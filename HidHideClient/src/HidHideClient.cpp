@@ -746,6 +746,10 @@ namespace
             notifications.For(650);
             auto originalParent = root / L"original-parent";
             std::filesystem::rename(catalogRoot.parent_path(), originalParent);
+            // Let the coordinator notice the missing parent and try to reload.
+            // A read must not recreate that directory, or putting it back fails.
+            notifications.For(1250);
+            require(!std::filesystem::exists(catalogRoot.parent_path()), "Coordinator recreated the renamed parent directory");
             std::filesystem::copy(originalParent, catalogRoot.parent_path(), std::filesystem::copy_options::recursive);
             notifications.For(1250);
             auto settings = RepositoryView(catalogRoot).Load().snapshot.settings; settings.paused = true;
@@ -855,7 +859,8 @@ namespace
     }
 
     // Cross-process acceptance exercises the current editor service without constructing
-    // retired profile controls. Only the device-coalescer phase needs a hidden HWND.
+    // retired profile controls. The device-coalescing and end-session phases create
+    // the hidden engine dialog; the coordinator-* phases use a message-only window.
     bool RunProfileRestartWorker()
     {
         if (__argc < 2 || _wcsicmp(__wargv[1], L"--profile-restart-test") != 0) return false;
@@ -930,8 +935,12 @@ namespace
                 // A profile change queued before WM_ENDSESSION (apps start and stop
                 // during logoff) must not re-apply hiding after the restore. Restart
                 // Manager closes keep the process alive, so pump what is left.
+                // The watcher covers the catalog's parent; keep that inside this
+                // fixture so unrelated activity in the temp directory cannot
+                // stand in for the queued profile change this phase proves.
+                auto catalog = root / L"Profiles";
                 {
-                    ProfileApplicationService application(root); application.OpenOrCreate();
+                    ProfileApplicationService application(catalog); application.OpenOrCreate();
                     Profile race; race.id = NewStableId(); race.name = L"Race"; race.kind = Kind::Application;
                     race.executable = NormalizeExecutable(root/L"Race.exe");
                     race.rules.push_back({L"HID\\RACE_PEDALS", L"Race pedals", Visibility::Hidden});
@@ -939,7 +948,7 @@ namespace
                 }
                 std::atomic_bool running{};
                 auto executable = NormalizeExecutable(root/L"Race.exe");
-                ProfilesAcceptanceContext context{root, enforcement, devices, [&]
+                ProfilesAcceptanceContext context{catalog, enforcement, devices, [&]
                 { return running.load() ? std::vector<ProcessObservation>{{4343, 1, L"Race.exe", executable, true}} : std::vector<ProcessObservation>{}; }};
                 CHidHideClientDlg dialog(nullptr, context);
                 require(dialog.Create(IDD_DIALOG_APPLICATION) != FALSE, "hidden engine window creation failed");

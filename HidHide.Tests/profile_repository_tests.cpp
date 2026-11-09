@@ -116,7 +116,12 @@ namespace
     struct TempDirectory
     {
         std::filesystem::path path{ TempRoot() };
-        ~TempDirectory() { std::error_code ignored; std::filesystem::remove_all(path, ignored); }
+        // A repository rooted directly here leaves its writer lock beside it.
+        ~TempDirectory()
+        {
+            std::error_code ignored; std::filesystem::remove_all(path, ignored);
+            auto lock = path; lock += L".writer.lock"; std::filesystem::remove(lock, ignored);
+        }
     };
     std::filesystem::path ClientExecutable()
     {
@@ -904,14 +909,17 @@ TEST(ProfileRepository, CrossProcessWriterLeaseSerializesApplyAndPreservesCas)
 
 TEST(ProfileRepository, ReadingTheRepositoryDoesNotTriggerItsChangeWatcher)
 {
-    // The coordinator reloads when the repository directory changes (same
-    // filter as RepositoryWatcherMain). Taking the writer lease for a read must
-    // not change it, or every reload triggers the next one and the engine's
+    // The coordinator reloads when anything under the repository's parent
+    // directory changes (same directory, depth and filter as
+    // RepositoryWatcherMain). Taking the writer lease for a read must not
+    // change that tree, or every reload triggers the next one and the engine's
     // GUI thread spins forever.
-    TempDirectory temp; ProfileRepository repository(temp.path); repository.OpenOrCreate();
-    HANDLE changed = ::FindFirstChangeNotificationW(temp.path.c_str(), FALSE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE);
+    TempDirectory temp; auto root = temp.path / L"HidHide Profiles" / L"Profiles";
+    ProfileRepository repository(root); repository.OpenOrCreate();
+    HANDLE changed = ::FindFirstChangeNotificationW(root.parent_path().c_str(), TRUE,
+        FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE);
     ASSERT_NE(INVALID_HANDLE_VALUE, changed);
-    RepositoryView view(temp.path);
+    RepositoryView view(root);
     EXPECT_NO_THROW(view.Load());
     EXPECT_NO_THROW(view.Inspect());
     EXPECT_NO_THROW(repository.Version(repository.Load().snapshot.settings.selectedGlobalId));
@@ -1072,6 +1080,79 @@ TEST(ProfileRepository, OrdinarySaveFailureRollsBackInProcessAndKeepsRepositoryL
     ::CloseHandle(locked);
     EXPECT_NO_THROW(repository.Apply(changed, repository.Version(id), settings, repository.SettingsVersion()));
     EXPECT_EQ(L"Changed", view.Load().snapshot.profiles.at(id).name);
+}
+
+TEST(ProfileRepository, RollbackCleanupThatFailsPartWayLeavesNoUnrecoverableIntent)
+{
+    // The in-process rollback runs while the cause of the save failure is
+    // still present. Here a foreign handle keeps the second item's staged file
+    // from being renamed or deleted: the first item's backup is removed, then
+    // cleanup fails. An intent left behind at that point could never be
+    // recovered, because its preflight demands the backup that is gone.
+    TempDirectory temp; ProfileRepository setup(temp.path); auto loaded = setup.OpenOrCreate(); auto id = loaded.snapshot.settings.selectedGlobalId; HANDLE locked{ INVALID_HANDLE_VALUE };
+    auto oldBytes = RepositoryBytes(temp.path);
+    ProfileRepository failing(temp.path, [&](CommitBoundary boundary, std::size_t)
+    {
+        if (boundary != CommitBoundary::IntentFlushed || locked != INVALID_HANDLE_VALUE) return;
+        for (auto const& entry : std::filesystem::directory_iterator(temp.path))
+        {
+            auto name = entry.path().filename().native(); std::wstring const suffix{ L".1.tmp" };
+            if (name.size() > suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0)
+            { locked = ::CreateFileW(entry.path().c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr); break; }
+        }
+    });
+    auto changed = loaded.snapshot.profiles.at(id); changed.name = L"Changed"; auto settings = loaded.snapshot.settings; settings.mode = Mode::UseGlobal;
+    EXPECT_THROW(failing.Apply(changed, failing.Version(id), settings, failing.SettingsVersion()), std::system_error);
+    ASSERT_NE(INVALID_HANDLE_VALUE, locked);
+    EXPECT_FALSE(std::filesystem::exists(temp.path / L".transaction.intent"));
+    RepositoryView view(temp.path); LoadResult reloaded;
+    EXPECT_NO_THROW(reloaded = view.Load()); EXPECT_EQ(oldBytes, RepositoryBytes(temp.path)); EXPECT_TRUE(view.Inspect().issues.empty());
+    ::CloseHandle(locked);
+    ProfileRepository repository(temp.path);
+    EXPECT_NO_THROW(repository.Recover());
+    EXPECT_NO_THROW(repository.Apply(changed, repository.Version(id), settings, repository.SettingsVersion()));
+    EXPECT_EQ(L"Changed", view.Load().snapshot.profiles.at(id).name);
+    // The orphaned staging files of the failed attempt were swept.
+    for (auto const& entry : std::filesystem::directory_iterator(temp.path)) EXPECT_EQ(L".json", entry.path().extension().native()) << Json::ToUtf8(entry.path().filename().native());
+}
+
+TEST(ProfileRepository, ReadsOfAnAbsentRepositoryNeitherCreateItNorHideThatItIsUninitialized)
+{
+    // The coordinator must be able to report an absent catalog and offer to
+    // seed it. Taking the lease for a read creates nothing: not the repository,
+    // and not a parent that was renamed away and is about to be put back.
+    TempDirectory temp; auto root = temp.path / L"HidHide Profiles" / L"Profiles";
+    RepositoryView view(root);
+    EXPECT_FALSE(view.Inspect().issues.empty());
+    EXPECT_ANY_THROW(view.Load());
+    bool uninitialized{}; EXPECT_NO_THROW(uninitialized = view.CatalogUninitialized()); EXPECT_TRUE(uninitialized);
+    EXPECT_FALSE(std::filesystem::exists(root));
+    EXPECT_FALSE(std::filesystem::exists(root.parent_path()));
+    // With the parent present the lock is created there, and still not the repository.
+    std::filesystem::create_directories(root.parent_path());
+    EXPECT_FALSE(view.Inspect().issues.empty());
+    EXPECT_TRUE(std::filesystem::exists(root.parent_path() / L"Profiles.writer.lock"));
+    EXPECT_FALSE(std::filesystem::exists(root));
+}
+
+TEST(ProfileRepository, StagingOrphansOfAFailedFirstSaveDoNotBlockSeedingTheCatalog)
+{
+    // Seeding a new catalog fails while its first staged file is being written.
+    // The orphan it leaves is not catalog evidence: the catalog still reports
+    // as uninitialized, and a second attempt sweeps the orphan and succeeds.
+    TempDirectory temp; bool fired{};
+    ProfileRepository failing(temp.path, [&](CommitBoundary boundary, std::size_t index)
+    { if (boundary == CommitBoundary::TempFlushed && index == 0 && !std::exchange(fired, true)) throw std::runtime_error("injected staging failure"); });
+    EXPECT_ANY_THROW(failing.OpenOrCreateObserved(std::set<std::filesystem::path>{}));
+    ASSERT_TRUE(fired);
+    bool orphan{}; for (auto const& entry : std::filesystem::directory_iterator(temp.path)) orphan = orphan || entry.path().extension() == L".tmp";
+    EXPECT_TRUE(orphan);
+    RepositoryView view(temp.path);
+    EXPECT_TRUE(view.CatalogUninitialized());
+    ProfileRepository repository(temp.path); LoadResult seeded;
+    EXPECT_NO_THROW(seeded = repository.OpenOrCreateObserved(std::set<std::filesystem::path>{})); EXPECT_TRUE(seeded.issues.empty());
+    EXPECT_FALSE(view.CatalogUninitialized());
+    for (auto const& entry : std::filesystem::directory_iterator(temp.path)) EXPECT_EQ(L".json", entry.path().extension().native()) << Json::ToUtf8(entry.path().filename().native());
 }
 
 TEST(ProfileRepository, CommittedSaveWithPendingCleanupRemainsLoadable)

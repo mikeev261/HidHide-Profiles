@@ -72,9 +72,12 @@ namespace HidHide::Profiles
     // Serializes one repository across threads, processes and sessions of the
     // same user. The lock is an exclusive "<repository>.writer.lock" file next to
     // the repository directory, in the user's own profile: unlike a predictable
-    // Global object name, other users cannot create or deny it. It is deleted on
-    // release and freed if a holder dies. It is deliberately outside the
-    // repository directory, whose change notifications trigger reloads.
+    // Global object name, other users cannot create or deny it. Exclusivity is the
+    // open handle, so the lease is freed if a holder dies. The empty file itself
+    // is created once and then left in place: the coordinator watches the
+    // repository's parent directory recursively, and creating or deleting any
+    // file there on each read would trigger a reload that reads again, forever.
+    // Opening an existing file raises no change notification.
     // Nested leases on one thread are reentrant, like the mutex this replaces.
     class WriterLease
     {
@@ -89,16 +92,23 @@ namespace HidHide::Profiles
             m_Key = canonical.native(); std::transform(m_Key.begin(), m_Key.end(), m_Key.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
             auto& held = Held();
             if (auto it = held.find(m_Key); it != held.end()) { ++it->second.second; return; }
-            std::error_code ec; std::filesystem::create_directories(canonical, ec);
-            if (ec) throw std::system_error(ec, "Create profile repository");
+            // The lock lives beside the repository. Taking a lease creates no
+            // directory: an absent catalog, or an absent parent that someone is
+            // about to put back, is a state the coordinator reports and must
+            // not disturb. Writers create the repository before they lease it.
             auto path = canonical.parent_path() / (canonical.filename().native() + L".writer.lock"); auto deadline = ::GetTickCount64() + 10000;
             HANDLE file{};
-            while ((file = ::CreateFileW(path.c_str(), GENERIC_READ | DELETE, 0, nullptr, OPEN_ALWAYS,
-                FILE_ATTRIBUTE_HIDDEN | FILE_FLAG_DELETE_ON_CLOSE, nullptr)) == INVALID_HANDLE_VALUE)
+            while ((file = ::CreateFileW(path.c_str(), GENERIC_READ, 0, nullptr, OPEN_ALWAYS,
+                FILE_ATTRIBUTE_HIDDEN, nullptr)) == INVALID_HANDLE_VALUE)
             {
-                // Held by another writer, or still being deleted by the last one.
+                // A sharing violation means another writer holds the lease. The
+                // file is never deleted, so any other failure is not transient.
                 auto error = ::GetLastError();
-                if ((error != ERROR_SHARING_VIOLATION && error != ERROR_ACCESS_DENIED) || ::GetTickCount64() >= deadline)
+                // Without a parent directory there is no repository to serialize
+                // against. This lease is empty and is not recorded as held, so a
+                // writer nested under it still takes the real lock.
+                if (error == ERROR_PATH_NOT_FOUND) { m_Key.clear(); return; }
+                if (error != ERROR_SHARING_VIOLATION || ::GetTickCount64() >= deadline)
                     throw std::system_error(error == ERROR_SHARING_VIOLATION ? ERROR_BUSY : error, std::system_category(), "Acquire repository writer lease");
                 ::Sleep(15);
             }
@@ -150,10 +160,26 @@ namespace HidHide::Profiles
             WriterLease lease(m_Root); return !std::filesystem::exists(m_Root / L"settings.json") && !HasCatalogEvidenceLocked();
         }
     protected:
+        // Names the commit protocol generates for staging files:
+        // ".<transaction>.<ordinal>" with .tmp, .bak or .restore, and the
+        // unpublished ".new" record files. They can never name a catalog file.
+        static bool IsStagingOrphanName(std::wstring const& name)
+        {
+            if (name == L".transaction.intent.new" || name == L".transaction.committed.new") return true;
+            if (name.size() < 43 || name[0] != L'.' || name[37] != L'.') return false;
+            auto extension = std::filesystem::path(name).extension().native();
+            auto ordinal = name.substr(38, name.size() - 38 - extension.size());
+            return IsStableId(name.substr(1, 36)) && !ordinal.empty() && std::all_of(ordinal.begin(), ordinal.end(), ::iswdigit)
+                && (extension == L".tmp" || extension == L".bak" || extension == L".restore");
+        }
         bool HasCatalogEvidenceLocked() const
         {
-            std::error_code ec;
-            for (auto const& entry : std::filesystem::directory_iterator(m_Root, ec)) if (entry.is_regular_file()) return true;
+            // Reads never create the repository directory; an absent one holds no evidence.
+            // Staging files orphaned by a failed first save are not evidence
+            // either: the next writer sweeps them, and seeding must stay possible.
+            std::error_code ec; if (!std::filesystem::exists(m_Root, ec) && !ec) return false;
+            for (auto const& entry : std::filesystem::directory_iterator(m_Root, ec))
+                if (entry.is_regular_file() && !IsStagingOrphanName(entry.path().filename().native())) return true;
             if (ec) throw std::system_error(ec, "Inspect profile repository before initialization");
             return false;
         }
@@ -729,12 +755,9 @@ namespace HidHide::Profiles
                 for (auto const& entry : std::filesystem::directory_iterator(m_Root, ec))
                 {
                     auto name = entry.path().filename().native();
-                    if (!entry.is_regular_file() || name.size() < 43 || name[0] != L'.' || name[37] != L'.') continue;
-                    auto id = name.substr(1, 36); auto extension = entry.path().extension().native();
-                    auto ordinal = name.substr(38, name.size() - 38 - extension.size());
-                    if (IsStableId(id) && !ordinal.empty() && std::all_of(ordinal.begin(), ordinal.end(), ::iswdigit)
-                        && (extension == L".tmp" || extension == L".bak"))
-                        std::filesystem::remove(entry.path(), ec);
+                    // The two ".new" record files are removed, checked, just below.
+                    if (!entry.is_regular_file() || name.size() < 43 || !IsStagingOrphanName(name)) continue;
+                    std::filesystem::remove(entry.path(), ec);
                     if (ec) throw std::system_error(ec, "Remove orphaned repository staging file");
                 }
                 if (ec) throw std::system_error(ec, "Enumerate repository staging files");
@@ -811,6 +834,11 @@ namespace HidHide::Profiles
                 }
                 Fire(CommitBoundary::RecoveryVerified, 0);
             }
+            // Every target is verified, so the intent has done its work. Remove
+            // it before the staging files: if a later delete fails or the
+            // process dies, only orphans remain for the sweep above. Deleting a
+            // backup first would leave an intent that no recovery could satisfy.
+            DeleteChecked(intentPath, "Remove recovered repository intent");
             for (std::size_t index{}; index < items.size(); ++index)
             {
                 auto const& item = items[index];
@@ -818,7 +846,7 @@ namespace HidHide::Profiles
                 DeleteChecked(m_Root / (L"." + parsed.transaction + L"." + std::to_wstring(index) + L".restore"), "Remove recovery staging file");
                 DeleteChecked(m_Root / item.backupName, "Remove recovered repository backup");
             }
-            DeleteChecked(intentPath, "Remove recovered repository intent"); DeleteChecked(committedPath, "Remove recovered repository commit marker");
+            DeleteChecked(committedPath, "Remove recovered repository commit marker");
             DeleteChecked(RecordStaging(committedPath), "Remove unpublished repository commit marker");
         }
         FailureHook m_FailureHook;
