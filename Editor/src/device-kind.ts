@@ -30,6 +30,8 @@ const rules:readonly [RegExp,DeviceKind,ControllerClass][]=[
  [/\b(?:mongoos[st]?[ -]?t[ -]?50cm3|flight\s+throttle|throttle)\b/,'throttle','game'],
  [/\bhandbrake\b/,'handbrake','game'],
  [/\bshifter\b/,'shifter','game'],
+ // A wheel sold with its pedals is identified by the wheel; separate pedal sets stay pedals.
+ [/\b(?:steering\s+|racing\s+)?wheel\b.*\bpedals?\b|\bpedals?\b.*\b(?:steering|racing)\s+wheel\b/,'wheel','game'],
  [/\b(?:pedals?|activepedal)\b|\bheusinkveld\b.*\b(?:sprint|ultimate)\b/,'pedals','game'],
  [/\bgsi\s+gxl\s*v?2\b|\b(?:steering|wheel|simucube)\b/,'wheel','game'],
  [/\b(?:joystick|hotas|flight\s*stick|flight\s*yoke)\b/,'joystick','game'],

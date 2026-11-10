@@ -70,12 +70,53 @@ public sealed partial class DriverTransaction
             throw new InvalidOperationException("Removed driver still has unexpected ownership or baseline.");
     }
 
+    // Resources observed exactly as before prove the transaction changed
+    // nothing, even when a step's outcome was never acknowledged. Removals and
+    // restart-pending or unfinished binding work may still take effect later.
+    static bool ObservedAsBefore(TransactionRecord record, DriverState observed) =>
+        !record.Reboot &&
+        record.Steps.All(x => x.Kind is StepKind.Stage or StepKind.CreateNode or StepKind.Bind or StepKind.Filter) &&
+        record.Steps.All(x => x.Completed || x.Kind != StepKind.Bind) &&
+        ProtectedJournal.StateBytes(observed).SequenceEqual(ProtectedJournal.StateBytes(record.Before));
+
+    // A worker killed inside a native call leaves an unacknowledged step whose
+    // call may still land after this observation. A call that returned an error
+    // (RecoveryRequired) cannot, and neither can one that a verified restart
+    // separates from now. Until then the step and the exclusion are kept.
+    static bool CallMayBeInFlight(TransactionRecord record, string currentBootId) =>
+        record.Steps.Any(x => !x.Completed) && record.Status != JournalStatus.RecoveryRequired &&
+        !BootIdentity.Changed(string.IsNullOrEmpty(record.RestartAnchor) ? record.BootId : record.RestartAnchor, currentBootId);
+
+    public static bool Unchanged(TransactionRecord record, DriverState observed, string currentBootId) =>
+        ObservedAsBefore(record, observed) && !CallMayBeInFlight(record, currentBootId);
+
+    // Unchanged so far, but only a restart can prove the interrupted call is gone.
+    public static bool UnchangedPendingRestart(TransactionRecord record, DriverState observed, string currentBootId) =>
+        ObservedAsBefore(record, observed) && CallMayBeInFlight(record, currentBootId);
+
+    // Legacy clock-based evidence can never prove a restart. Before asking for
+    // one, record this boot as the anchor (as VerifyRestart does), so the next
+    // boot can be told apart from it and the interrupted transaction can close.
+    public static void AnchorLegacyInterruption(ITransactionJournal journal, TransactionRecord record, string currentBootId)
+    {
+        string anchor = string.IsNullOrEmpty(record.RestartAnchor) ? record.BootId : record.RestartAnchor;
+        if (BootIdentity.Stable(anchor) || !BootIdentity.Stable(currentBootId)) return;
+        if (string.IsNullOrEmpty(record.BootId)) record.BootId = currentBootId;
+        record.AnchorRestartEvidence(currentBootId); journal.Save(record);
+    }
+
     public JournalStatus Rollback(string currentBootId)
     {
         ProtectedJournal.Validate(record);
         if (record.RollbackDirection || record.Status != JournalStatus.Applied && record.Status != JournalStatus.RecoveryRequired &&
             record.Status != JournalStatus.Applying && record.Status != JournalStatus.RebootRequired)
             throw new InvalidOperationException("Cannot begin rollback from this transaction state.");
+        if (Unchanged(record, backend.Inspect(), currentBootId))
+        {
+            DiscardUnappliedSteps(record);
+            record.RollbackDirection = true; record.Status = JournalStatus.RolledBack; record.Failure = "";
+            journal.Save(record); return record.Status;
+        }
         ValidateRollbackOwnership();
         if (record.Steps.Any(x => x.Undone || x.UndoStarted)) throw new InvalidOperationException("Historical rollback direction is unknown.");
         if (record.Reboot)

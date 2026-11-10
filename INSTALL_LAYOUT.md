@@ -13,11 +13,12 @@ Release readiness and supported paths are tracked in docs/release-readiness.md.
 | Start menu\HidHide Profiles | One shortcut to the native launcher, which opens the Electron editor |
 | %ProgramData%\mikeev261\HidHide\Maintenance | Protected setup cache, journals and recovery evidence (compatibility namespace) |
 | %LOCALAPPDATA%\HidHide Profiles\Profiles | Initiating ordinary user's versioned `settings.json` and one JSON file per profile |
+| %LOCALAPPDATA%\HidHide Profiles\Profiles.writer.lock | Empty hidden lock file for that repository; created once and left in place, including after uninstall. Safe to delete while the engine is stopped |
 
 Closing the editor exits every Electron process. The ordinary-user native
 `HidHideClient.exe` coordinator remains responsible for automatic profile matching,
 application, baseline recovery and the tray menu. Tray Exit restores the baseline
-and stops monitoring. Maintenance requires the editor to close before handoff;
+and stops monitoring; the baseline is also restored at logoff and shutdown. Maintenance requires the editor to close before handoff;
 setup never terminates an editor that may hold an unsaved draft.
 
 The profiles-first catalog is authoritative from a fresh install and has no

@@ -104,7 +104,11 @@ CProfilesCoordinator::CProfilesCoordinator(HidHide::Profiles::IEnforcement& enfo
 {
     if (!m_MaintenanceSource) m_MaintenanceSource = [] { return HidHide::Maintenance::Active(); };
     auto observed = initialObservation ? std::move(*initialObservation) : m_Enforcement.Observe();
-    if (!observed.success || !observed.observedKnown) { m_Conflict = true; m_Status = observed.failure.empty() ? L"Driver state is unknown; activation is blocked" : observed.failure; }
+    // An unknown observation (for example a transient read failure) is retried;
+    // only a known conflict blocks activation until it is reviewed.
+    bool observationUnknown = !observed.observedKnown && !observed.conflict;
+    if (observationUnknown) m_Status = observed.failure.empty() ? L"Driver state is unknown; activation will retry" : observed.failure;
+    else if (!observed.success) { m_Conflict = true; m_Status = observed.failure.empty() ? L"Driver state is unknown; activation is blocked" : observed.failure; }
     auto loaded = m_Repository.Inspect(); m_Snapshot = std::move(loaded.snapshot); m_Issues = std::move(loaded.issues);
     m_SettingsVersion = std::move(loaded.settingsVersion); m_ProfileVersions = std::move(loaded.profileVersions);
     bool catalogValid{ m_Issues.empty() }; try { if (!catalogValid) throw std::runtime_error("Profile repository contains invalid files"); HidHide::Profiles::Validate(m_Snapshot); }
@@ -113,6 +117,7 @@ CProfilesCoordinator::CProfilesCoordinator(HidHide::Profiles::IEnforcement& enfo
     {
         catalogValid = false; m_Conflict = true; m_Status = L"Global Allowed apps changed outside HidHide Profiles; activation is blocked until reviewed";
     }
+    m_AllowedApplicationsUnchecked = (m_RepositoryInvalid || observationUnknown) && !m_Conflict;
     if (catalogValid && m_SystemIntegration)
     {
         try { m_StartupIssue = UpdateAutoStart(m_Snapshot.settings.startWithWindows); }
@@ -343,6 +348,26 @@ void CProfilesCoordinator::ScheduleReconcileRetry(bool pending)
     m_WorkerWake.notify_one();
 }
 
+// The startup Allowed-app comparison cannot run while the repository is
+// invalid. Run it on the first valid snapshot, so an external change (for
+// example a feeder registered with --app-reg) is reviewed, not overwritten.
+// It is also deferred while the driver cannot be observed at startup. Returns
+// false while the comparison is still pending; nothing may be applied then.
+bool CProfilesCoordinator::CheckDeferredAllowedApplications()
+{
+    if (!m_AllowedApplicationsUnchecked) return true;
+    if (m_Conflict || m_RepositoryInvalid) return false;
+    auto observed = m_Enforcement.Observe();
+    if (!observed.observedKnown && !observed.conflict)
+    { m_Status = observed.failure.empty() ? L"Driver state is unknown; activation will retry" : observed.failure; return false; }
+    m_AllowedApplicationsUnchecked = false;
+    if (!observed.success)
+    { m_Conflict = true; m_Status = observed.failure.empty() ? L"Driver state is unknown; activation is blocked" : observed.failure; }
+    else if (observed.observed.allowedApplications != m_Snapshot.settings.allowedApplications)
+    { m_Conflict = true; m_Status = L"Global Allowed apps changed outside HidHide Profiles; activation is blocked until reviewed"; }
+    return true;
+}
+
 bool CProfilesCoordinator::ReloadRepositoryIfChanged()
 {
     try
@@ -352,7 +377,7 @@ bool CProfilesCoordinator::ReloadRepositoryIfChanged()
         HidHide::Profiles::Validate(loaded.snapshot); m_EffectiveVerified = false; m_RunningProfiles.clear(); m_MissingProfiles.clear();
         m_Snapshot = std::move(loaded.snapshot); m_Issues = std::move(loaded.issues);
         m_SettingsVersion = std::move(loaded.settingsVersion); m_ProfileVersions = std::move(loaded.profileVersions); m_RepositoryInvalid = false;
-        m_Status = L"Repository changed outside this window; open drafts require conflict review"; SubmitSnapshot(); return true;
+        m_Status = L"Repository changed outside this window; open drafts require conflict review"; CheckDeferredAllowedApplications(); SubmitSnapshot(); return true;
     }
     catch (std::exception const& error)
     {
@@ -375,7 +400,18 @@ CProfilesCoordinator::ApplyOutcome CProfilesCoordinator::Reconcile(HidHide::Prof
     // unresolved, but no saved=true path may bypass the enforcement block.
     if (m_RepositoryInvalid) { ScheduleReconcileRetry(false); m_EffectiveVerified = false; return { saved, false, false, saved ? L"Saved, but repository validation remains unresolved; nothing was applied." : m_Status, version }; }
     if (m_Conflict) { ScheduleReconcileRetry(false); m_EffectiveVerified = false; return { saved, false, false, saved ? L"Saved. Driver recovery or external-state conflict remains unresolved; nothing was applied." : m_Status, version }; }
+    if (!CheckDeferredAllowedApplications() || m_Conflict)
+    {
+        // A driver that cannot be observed yet is transient: retry. A conflict
+        // found by the deferred comparison waits for review instead.
+        ScheduleReconcileRetry(!m_Conflict);
+        m_EffectiveVerified = false;
+        return { saved, false, false, saved ? (m_Conflict ? L"Saved. Driver recovery or external-state conflict remains unresolved; nothing was applied." : L"Saved. Driver state could not be observed yet; nothing was applied.") : m_Status, version };
+    }
     if (m_AdoptedNeedsApply && !saved) { ScheduleReconcileRetry(false); return { false, false, true, L"Current driver settings were accepted. Press Apply after reviewing global Allowed apps.", version }; }
+    // Stop() has restored the baseline; nothing may hide devices again after it,
+    // including a queued or re-entrant request that runs before the window dies.
+    if (StopRequested()) { ScheduleReconcileRetry(false); m_EffectiveVerified = false; return { saved, false, false, saved ? L"Saved. HidHide Profiles is closing; nothing was applied." : L"HidHide Profiles is closing", version }; }
     try
     {
         if (m_MaintenanceSource()) { ScheduleReconcileRetry(true); return { saved, false, false, saved ? L"Saved. Setup maintenance is active; nothing was activated." : L"Setup maintenance is active", version }; }
@@ -432,7 +468,7 @@ CProfilesCoordinator::ApplyOutcome CProfilesCoordinator::PublishSaved(HidHide::P
         // Observe/Reconcile readback may mark the new snapshot effective.
         m_EffectiveVerified = false; m_RunningProfiles.clear(); m_MissingProfiles.clear();
         m_Snapshot = std::move(loaded.snapshot); m_Issues.clear(); m_RepositoryInvalid = false;
-        m_SettingsVersion = std::move(loaded.settingsVersion); m_ProfileVersions = std::move(loaded.profileVersions); SubmitSnapshot();
+        m_SettingsVersion = std::move(loaded.settingsVersion); m_ProfileVersions = std::move(loaded.profileVersions); CheckDeferredAllowedApplications(); SubmitSnapshot();
         // Publication is the durable decision boundary. Once the reviewed
         // draft is saved, activation failures must remain retryable without
         // requiring a fabricated second JSON revision.
@@ -533,7 +569,7 @@ void CProfilesCoordinator::ValidateLaunch(std::wstring const& id, DWORD ownPid)
         if (process.exitedAt || process.processId == ownPid || _wcsicmp(process.fileName.c_str(), executable.filename().c_str()) != 0) continue;
         if (!process.pathAccessible || process.verifiedPath.empty())
             throw std::runtime_error("A same-name process cannot be identified; close it before launching this profile");
-        if (_wcsicmp(HidHide::Profiles::NormalizeExecutable(process.verifiedPath).c_str(), executable.c_str()) == 0)
+        if (_wcsicmp(HidHide::Profiles::NormalizeObservedExecutable(process.verifiedPath).c_str(), executable.c_str()) == 0)
             throw std::runtime_error("This application is already running and may hold physical devices; close it before launching through HidHide Profiles");
     }
 }
@@ -628,6 +664,7 @@ HidHide::Profiles::EnforcementResult CProfilesCoordinator::ObserveEnforcement()
 
 void CProfilesCoordinator::Tick()
 {
+    if (StopRequested()) return;
     try
     {
         if (m_MaintenanceSource()) { ScheduleReconcileRetry(true); m_EffectiveVerified = false; m_Status = L"Setup maintenance is active; profile monitoring is suspended"; return; }
@@ -697,8 +734,38 @@ std::set<std::filesystem::path> CProfilesCoordinator::AdoptExternalState()
         m_Issues.clear(); m_Issues.push_back({ m_Repository.Root(), std::wstring(error.what(), error.what() + strlen(error.what())) });
         throw std::logic_error("The JSON repository changed while confirmation was open; current driver settings were not adopted");
     }
+    if (StopRequested()) throw std::runtime_error("HidHide Profiles is closing; current driver settings were not adopted");
     auto result = m_Enforcement.AdoptCurrentAsBaseline(); if (!result.success || !result.observedKnown) throw std::runtime_error("Current driver settings could not be adopted");
     m_Conflict = false; m_Status = L"Current driver settings accepted; review the staged global Allowed apps and press Apply"; m_AdoptedNeedsApply = true;
+    return result.observed.allowedApplications;
+}
+
+bool CProfilesCoordinator::CatalogUninitialized() const
+{
+    try { return m_RepositoryInvalid && m_Repository.CatalogUninitialized(); }
+    catch (...) { return false; }
+}
+
+// A fresh catalog is seeded only from a conflict-free observation. When stale
+// recovery evidence blocks that at first start, and no catalog file exists that
+// could itself be evidence, explicit adoption is the only way out: it clears
+// the evidence through the ordinary adoption path and returns the adopted
+// Allowed apps. The caller then creates the catalog from them and publishes it.
+std::set<std::filesystem::path> CProfilesCoordinator::AdoptExternalStateForNewCatalog()
+{
+    if (!m_RepositoryInvalid || !m_Repository.CatalogUninitialized())
+        throw std::logic_error("Driver settings can seed a profile catalog only while no catalog files exist; repair or restore the repository first");
+    HidHide::Profiles::EnforcementResult result;
+    if (m_Conflict) result = m_Enforcement.AdoptCurrentAsBaseline();
+    else
+    {
+        // Adoption already cleared the evidence (for example when creating the
+        // catalog failed afterwards); only a conflict-free readback may seed it.
+        result = m_Enforcement.Observe();
+        if (result.conflict) { m_Conflict = true; m_Status = result.failure; throw std::runtime_error("Driver settings need review before a profile catalog can be created"); }
+    }
+    if (!result.success || !result.observedKnown) throw std::runtime_error("Current driver settings could not be adopted");
+    m_Conflict = false; m_Status = L"Current driver settings accepted; the profile catalog is being created from them";
     return result.observed.allowedApplications;
 }
 
@@ -723,6 +790,9 @@ CProfilesCoordinator::ApplyOutcome CProfilesCoordinator::AbandonAdoptionDraft()
     else outcome.message = L"Adopted Allowed-app changes were discarded. The saved profile policy still needs activation. " + outcome.message;
     return outcome;
 }
+
+bool CProfilesCoordinator::StopRequested()
+{ std::lock_guard<std::mutex> lock(m_WorkerMutex); return m_StopRequested; }
 
 void CProfilesCoordinator::Stop() noexcept
 {

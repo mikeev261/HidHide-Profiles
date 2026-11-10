@@ -2,9 +2,11 @@
 
 The issue is valid: a WMI boot timestamp depends on wall-clock interpretation.
 Timestamp inequality could authorize forward/rollback continuation after a clock
-correction in the same boot, and equality could refuse a later boot. The current
-public MSI caller is `Installer/DirectMsiActions.cs`; historical `DirectMsiFlow`
-references are obsolete.
+correction in the same boot, and equality could refuse a later boot. The public
+MSI custom actions are in `Installer/DirectMsiActions.cs`; they delegate the
+session-free orchestration to `Installer/DirectMsiFlow.cs`, which carries the
+ownership, restart-obligation and commit-restart rules described here and is
+exercised end to end by `DirectMsiFlowChecks`.
 
 The Windows 11 x64 worker now reads the clock-independent `ULONG BootId` from
 `KUSER_SHARED_DATA` through read-only `ReadProcessMemory`. The supported shared
@@ -46,6 +48,21 @@ no-forced-restart policy. Historical controller restart comparisons now require
 stable identities too; its older numeric setup/legacy recovery checkpoints stop
 conservatively for explicit recovery rather than automatically advancing.
 
+Two commits finish while class filters still await a restart. An upgrade, which
+never carries the restart obligation, may commit a verified filter-only addition
+to its retained healthy driver. A continuation that verified its restart, cleared
+the obligation and then attached filters may commit in that boot; it runs in
+ApplyDriver's recovery pass, because Windows Installer runs the whole sequence
+again after its forced restart. Neither applies while the obligation is still set
+or the journal holds only legacy boot evidence. Setup only logs that a further
+restart activates the filters: a deferred action cannot set the installer's
+restart mode, and no immediate action requests it yet.
+
+A transaction whose worker was killed inside a native call keeps its
+unacknowledged step and the maintenance exclusion in that boot, even when the
+driver is observed exactly as before, because the call may still land. A recovery
+run closes it only after a verified restart, or when the call returned an error.
+
 Use Windows **Restart**, not a Fast Startup shutdown. Microsoft documents that
 Fast Startup and hibernation restore kernel/driver memory. Retained boot identity
 is rejected; fixture coverage proves this equality behavior. The primary BootId
@@ -57,7 +74,10 @@ not establish that power-mode behavior or a real driver reboot/resume lifecycle.
 Public MSI preparation, finalization, rollback completion and worker execution
 load and validate their transaction inside the maintenance ownership interval.
 The production `OwnedJournal` scope acquires before loading, rejects committed
-transactions and releases ownership on load/validation failure. MSI releases
+transactions and releases ownership on load/validation failure. The one exception
+is a recovery run closing a transaction whose marker outlived its commit: it may
+load the committed journal, but only clears the marker when the driver is observed
+exactly as before and then fails so the next setup starts fresh. MSI releases
 ownership before waiting for a child worker, which independently reloads after
 acquisition. A queued caller therefore cannot overwrite an advanced native prefix,
 restart anchor or legacy migration with its earlier snapshot. Recovery revalidates

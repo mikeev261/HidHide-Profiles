@@ -65,6 +65,8 @@ public:
     void SetNotificationWindow(HWND window, UINT message);
     void ExitSafely();
     std::set<std::filesystem::path> AdoptExternalState();
+    bool CatalogUninitialized() const;
+    std::set<std::filesystem::path> AdoptExternalStateForNewCatalog();
     ApplyOutcome CompleteAdoptionWithoutSettingsChange(std::set<std::filesystem::path> const& observedAllowedApplications);
     ApplyOutcome AbandonAdoptionDraft();
     bool AdoptionAwaitingSave() const { return m_AdoptedNeedsApply; }
@@ -76,8 +78,10 @@ private:
     bool CanReconcileScan(bool complete) const;
     void WorkerMain() noexcept;
     void RepositoryWatcherMain() noexcept;
+    bool StopRequested();
     void SubmitSnapshot();
     void ScheduleReconcileRetry(bool pending);
+    bool CheckDeferredAllowedApplications();
     ApplyOutcome Reconcile(HidHide::Profiles::Selection const& selection, bool saved, HidHide::Profiles::SavedVersion version = {});
     void SetVerifiedSelection(HidHide::Profiles::Selection const& selection);
     static HidHide::Profiles::DesiredEnforcement Desired(HidHide::Profiles::Snapshot const& snapshot, HidHide::Profiles::Selection const& selection);
@@ -99,6 +103,7 @@ private:
     std::wstring m_StartupIssue;
     bool m_Conflict{};
     bool m_RepositoryInvalid{};
+    bool m_AllowedApplicationsUnchecked{};
     bool m_AdoptedNeedsApply{};
     bool m_EffectiveVerified{};
     std::uint64_t m_RepositoryWrites{};

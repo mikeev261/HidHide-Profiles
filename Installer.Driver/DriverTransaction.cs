@@ -159,7 +159,7 @@ public sealed partial class DriverTransaction
             throw new InvalidOperationException("Driver state changed after preparation.");
         if (record.Operation == Operation.Install && !state.CanInstall)
             throw new InvalidOperationException("Fresh installation requires empty driver ownership; migrate legacy first.");
-        if (record.Operation != Operation.Install && !(Reconstructing ? state.Repairable : state.CoreHealthy))
+        if (record.Operation != Operation.Install && !(Reconstructing ? state.Repairable : record.Operation == Operation.Uninstall ? state.Removable : state.CoreHealthy))
             throw new InvalidOperationException("Existing resources are not healthy and proven; explicit recovery required.");
         AnchorNewWork(currentBootId);
         record.Status = JournalStatus.Applying; journal.Save(record);
@@ -230,6 +230,51 @@ public sealed partial class DriverTransaction
             throw;
         }
     }
+    // True when no restart has been observed since this transaction's last
+    // native work. Legacy clock-based evidence never proves that.
+    public static bool SameBootAsWork(TransactionRecord record, string currentBootId) =>
+        BootIdentity.Stable(currentBootId) && BootIdentity.Stable(record.BootId) &&
+        (string.IsNullOrEmpty(record.RestartAnchor) ? record.BootId : record.RestartAnchor) == currentBootId;
+
+    // Only for a transaction already proven Unchanged: the driver is observed
+    // exactly as before and no native call can still be in flight. A step whose
+    // call was never acknowledged then had no effect, so it is not carried into
+    // the committed record that clears the maintenance marker.
+    public static void DiscardUnappliedSteps(TransactionRecord record) => record.Steps.RemoveAll(x => !x.Completed);
+
+    // A retained healthy driver whose only changes are verified class-filter
+    // additions may commit before the restart that activates them. Upgrades
+    // never force a mid-setup restart; the filters take effect after the next
+    // restart, which setup logs but does not request.
+    // An operation that still owes a verified restart never commits this way.
+    public static bool CanCommitBeforeRestart(TransactionRecord record, DriverState observed)
+    {
+        if (record.Status != JournalStatus.RebootRequired || !record.Reboot || record.RollbackDirection || record.CommitRebootRequired ||
+            record.Operation is not (Operation.Upgrade or Operation.Repair) || !record.Before.CoreHealthy || record.Before.Settings == null ||
+            record.Steps.Count == 0 || record.Steps.Any(x => x.Kind != StepKind.Filter || !x.Completed || x.UndoStarted || x.Undone) ||
+            !observed.Healthy || observed.Settings == null || !observed.Settings.Same(record.Before.Settings) ||
+            !observed.Nodes.Select(x => x.Id).SequenceEqual(record.Before.Nodes.Select(x => x.Id), StringComparer.OrdinalIgnoreCase) ||
+            !observed.Packages.SequenceEqual(record.Before.Packages, StringComparer.OrdinalIgnoreCase))
+            return false;
+        for (int index = 0; index < 3; index++)
+        {
+            var edits = record.Steps.Where(x => x.FilterIndex == index).ToArray();
+            if (edits.Length > 1 || !observed.Filters[index].Same(edits.SingleOrDefault()?.AfterFilter ?? record.Before.Filters[index])) return false;
+        }
+        return true;
+    }
+
+    // A continuation that already verified the bound driver on this boot and
+    // then only attached class filters may commit; the filters need a restart.
+    // The continuation records this boot as its anchor and clears the restart
+    // obligation only after it verified that Windows restarted.
+    public static bool CanCommitAfterResume(TransactionRecord record, DriverState observed, string currentBootId) =>
+        record.Status == JournalStatus.RebootRequired && record.Reboot && !record.RollbackDirection && !record.CommitRebootRequired &&
+        BootIdentity.Stable(record.BootId) && record.RestartAnchor == currentBootId &&
+        record.Operation is Operation.Install or Operation.Repair &&
+        record.Steps.All(x => x.Completed && !x.UndoStarted && !x.Undone) && record.Steps.Any(x => x.Kind == StepKind.Filter) &&
+        observed.Healthy && observed.Settings != null;
+
     public JournalStatus ResumeAfterReboot(string currentBootId)
     {
         ProtectedJournal.Validate(record);
@@ -258,7 +303,10 @@ public sealed partial class DriverTransaction
                 !string.Equals(state.Packages[0], expectedInf, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("Installed driver did not become healthy after reboot.");
             var defaults = ExpectedAfterBinding(Reconstructing ? record.Before.Settings : null);
-            if (state.Settings == null || !state.Settings.Same(defaults))
+            // A repair whose commit failed after its baseline was restored resumes
+            // with that baseline already in place; restoration tolerates it too.
+            bool restored = Reconstructing && record.Before.Settings != null && state.Settings != null && state.Settings.Same(record.Before.Settings);
+            if (state.Settings == null || !(state.Settings.Same(defaults) || restored))
                 throw new InvalidOperationException("Fresh driver settings changed before baseline restoration.");
         }
         else if (record.Operation == Operation.Uninstall)

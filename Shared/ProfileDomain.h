@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <Windows.h>
 
 namespace HidHide::Profiles
 {
@@ -99,8 +100,19 @@ namespace HidHide::Profiles
         if (!path.is_absolute() || path.native().rfind(L"\\\\", 0) == 0 || _wcsicmp(path.extension().c_str(), L".exe") != 0)
             throw std::invalid_argument("Application profile executable must be an absolute local .exe path");
         auto text = path.native();
-        std::transform(text.begin(), text.end(), text.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+        // Windows paths are case-insensitive for all of Unicode, not only ASCII.
+        if (!text.empty() && ::LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, text.c_str(), static_cast<int>(text.size()),
+            text.data(), static_cast<int>(text.size()), nullptr, nullptr, 0) != static_cast<int>(text.size()))
+            throw std::runtime_error("Application path case normalization failed");
         return text;
+    }
+
+    // Observed process images are not profile input. A path no profile could
+    // name (network share, device namespace, non-.exe image) is simply no match.
+    inline std::filesystem::path NormalizeObservedExecutable(std::filesystem::path const& path) noexcept
+    {
+        try { return NormalizeExecutable(path); }
+        catch (...) { return {}; }
     }
 
     inline void Validate(Profile const& profile)
@@ -241,7 +253,7 @@ namespace HidHide::Profiles
                 for (auto const& process : processes)
                 {
                     if (!process.processId || !process.lifetimeIdentity || !process.pathAccessible || process.verifiedPath.empty() || process.exitedAt) continue;
-                    if (NormalizeExecutable(process.verifiedPath) != entry.path) continue;
+                    if (NormalizeObservedExecutable(process.verifiedPath) != entry.path) continue;
                     entry.instances.emplace(process.processId, process.lifetimeIdentity);
                     if (!entry.created || process.lifetimeIdentity < entry.created) entry.created = process.lifetimeIdentity;
                 }
@@ -257,7 +269,7 @@ namespace HidHide::Profiles
                     for (auto const& process : processes)
                         if (process.lifetimeIdentity && process.lifetimeIdentity < entry.created
                             && process.exitedAt >= entry.created && process.pathAccessible && !process.verifiedPath.empty()
-                            && NormalizeExecutable(process.verifiedPath) == entry.path)
+                            && NormalizeObservedExecutable(process.verifiedPath) == entry.path)
                         { entry.created = process.lifetimeIdentity; earlier = true; }
                 } while (earlier);
                 auto old = m_Entries.find(id);
@@ -266,7 +278,7 @@ namespace HidHide::Profiles
                 // verified intervals, without bridging a real inactive gap.
                 std::uint64_t continuousUntil{};
                 if (old != m_Entries.end()) for (auto const& process : processes)
-                    if (process.exitedAt && process.pathAccessible && NormalizeExecutable(process.verifiedPath) == entry.path
+                    if (process.exitedAt && process.pathAccessible && NormalizeObservedExecutable(process.verifiedPath) == entry.path
                         && (process.processId ? old->second.instances.count({process.processId, process.lifetimeIdentity}) != 0
                             : std::any_of(old->second.instances.begin(), old->second.instances.end(), [&](auto const& instance)
                                 { return instance.second >= process.lifetimeIdentity && instance.second <= process.exitedAt; })))
@@ -277,7 +289,7 @@ namespace HidHide::Profiles
                     extended = false;
                     for (auto const& process : processes)
                         if (process.lifetimeIdentity && process.lifetimeIdentity <= continuousUntil && process.exitedAt > continuousUntil
-                            && process.pathAccessible && NormalizeExecutable(process.verifiedPath) == entry.path)
+                            && process.pathAccessible && NormalizeObservedExecutable(process.verifiedPath) == entry.path)
                         { continuousUntil = process.exitedAt; extended = true; }
                 } while (extended);
                 if (old != m_Entries.end() && (std::any_of(entry.instances.begin(), entry.instances.end(),
